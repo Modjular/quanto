@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ilastik Architecture Visualization</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        /* Custom scrollbar for a cleaner look */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .js-plotly-plot .plotly .cursor-pointer { cursor: pointer; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans min-h-screen p-4 md:p-8">
+
+    <div class="max-w-[1400px] mx-auto space-y-8">
+        <!-- Header -->
+        <header class="mb-10 text-center md:text-left">
+            <h1 class="text-4xl font-extrabold tracking-tight text-slate-900 mb-2">ilastik Codebase Architecture</h1>
+            <p class="text-lg text-slate-600 max-w-3xl">
+                Visualizing the distribution of "Core Capabilities" (math, algorithms, training) versus "Plumbing" (UI, file I/O, routing) across the repository.
+            </p>
+            <div class="mt-4 flex items-center justify-center md:justify-start gap-4 text-sm font-medium">
+                <span class="flex items-center gap-2"><div class="w-4 h-4 bg-[#2563eb] rounded-sm shadow-sm"></div> Core Capabilities</span>
+                <span class="flex items-center gap-2"><div class="w-4 h-4 bg-[#d1d5db] rounded-sm shadow-sm"></div> Plumbing / UI / IO</span>
+            </div>
+        </header>
+
+        <!-- Top Row: Bar Chart & Sunburst -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            
+            <!-- Stacked Bar Chart -->
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col">
+                <div class="mb-2">
+                    <h2 class="text-xl font-bold text-slate-800">Module-by-Module Comparison</h2>
+                    <p class="text-sm text-slate-500">Stacked bar showing the absolute file count per top-level module.</p>
+                </div>
+                <div id="bar-chart" class="w-full flex-grow h-[400px]"></div>
+            </div>
+
+            <!-- Sunburst Chart -->
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col">
+                <div class="mb-2 flex justify-between items-start">
+                    <div>
+                        <h2 class="text-xl font-bold text-slate-800">Architectural Depth</h2>
+                        <p class="text-sm text-slate-500">Rings represent folder depth. Click a slice to drill down.</p>
+                    </div>
+                </div>
+                <div id="sunburst-chart" class="w-full flex-grow h-[400px]"></div>
+            </div>
+            
+        </div>
+
+        <!-- Bottom Row: Treemap -->
+        <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+            <div class="mb-4">
+                <h2 class="text-xl font-bold text-slate-800">Codebase Footprint (Treemap)</h2>
+                <p class="text-sm text-slate-500">Box size = number of files. Color = density of core logic. Click a box to zoom into that directory.</p>
+            </div>
+            <div id="treemap-chart" class="w-full h-[650px]"></div>
+        </div>
+
+    </div>
+
+    <script>
+        // --- DATA INGESTION ---
+        const csvData = `File_Path,Category
+ilastik/__init__.py,Plumbing / UI / IO
+ilastik/__main__.py,Plumbing / UI / IO
+ilastik/app.py,Plumbing / UI / IO
+ilastik/clusterConfig.py,Plumbing / UI / IO
+ilastik/clusterOps.py,Core Capabilities
+ilastik/config.py,Plumbing / UI / IO
+ilastik/excepthooks.py,Plumbing / UI / IO
+ilastik/exceptions.py,Plumbing / UI / IO
+ilastik/workflow.py,Plumbing / UI / IO
+ilastik/ilastik-splash.png,Plumbing / UI / IO
+ilastik/ilastik-fist.png,Plumbing / UI / IO
+ilastik/applets/base/__init__.py,Plumbing / UI / IO
+ilastik/applets/base/applet.py,Plumbing / UI / IO
+ilastik/applets/base/appletGuiInterface.py,Plumbing / UI / IO
+ilastik/applets/base/singleToMultiGuiAdapter.py,Plumbing / UI / IO
+ilastik/applets/base/standardApplet.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/__init__.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/appletSerializer.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/jsonSerializerRegistry.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/legacyClassifiers.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/serializerUtils.py,Plumbing / UI / IO
+ilastik/applets/base/appletSerializer/slotSerializer.py,Plumbing / UI / IO
+ilastik/applets/batchProcessing/__init__.py,Plumbing / UI / IO
+ilastik/applets/batchProcessing/batchProcessingApplet.py,Plumbing / UI / IO
+ilastik/applets/batchProcessing/batchProcessingGui.py,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/__init__.py,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/blockwiseObjectClassificationApplet.py,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/blockwiseObjectClassificationGui.py,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/blockwiseObjectClassificationSerializer.py,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/drawer.ui,Plumbing / UI / IO
+ilastik/applets/blockwiseObjectClassification/opBlockwiseObjectClassification.py,Core Capabilities
+ilastik/applets/counting/__init__.py,Plumbing / UI / IO
+ilastik/applets/counting/countingApplet.py,Plumbing / UI / IO
+ilastik/applets/counting/countingBatchProcessingApplet.py,Plumbing / UI / IO
+ilastik/applets/counting/countingBatchProcessingGui.py,Plumbing / UI / IO
+ilastik/applets/counting/countingDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/counting/countingDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/counting/countingDrawer.ui,Plumbing / UI / IO
+ilastik/applets/counting/countingGui.py,Plumbing / UI / IO
+ilastik/applets/counting/countingGuiBoxesInterface.py,Plumbing / UI / IO
+ilastik/applets/counting/countingGuiDotsInterface.py,Plumbing / UI / IO
+ilastik/applets/counting/countingOperators.py,Core Capabilities
+ilastik/applets/counting/countingSerializer.py,Plumbing / UI / IO
+ilastik/applets/counting/countingsvr.py,Core Capabilities
+ilastik/applets/counting/dataExportDrawer.ui,Plumbing / UI / IO
+ilastik/applets/counting/menu.ui,Plumbing / UI / IO
+ilastik/applets/counting/opCounting.py,Core Capabilities
+ilastik/applets/counting/opCountingBatchResults.py,Core Capabilities
+ilastik/applets/counting/opCountingDataExport.py,Plumbing / UI / IO
+ilastik/applets/counting/tstCounting.py,Plumbing / UI / IO
+ilastik/applets/counting/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/CMakeLists.txt,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/FindCPLEX.cmake,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/FindGurobi.cmake,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/findversion.c,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/findcplexversion.c,Plumbing / UI / IO
+ilastik/applets/counting/cwrapper/cplex/cplexwrapper.c,Core Capabilities
+ilastik/applets/counting/cwrapper/gurobi/gurobiwrapper.c,Core Capabilities
+ilastik/applets/cropping/__init__.py,Plumbing / UI / IO
+ilastik/applets/cropping/cropSelectionApplet.py,Plumbing / UI / IO
+ilastik/applets/cropping/cropSelectionGui.py,Plumbing / UI / IO
+ilastik/applets/cropping/cropSelectionSerializer.py,Plumbing / UI / IO
+ilastik/applets/cropping/cropSelectionWidget.py,Plumbing / UI / IO
+ilastik/applets/cropping/cropSelectionWidget.ui,Plumbing / UI / IO
+ilastik/applets/cropping/croppingApplet.py,Plumbing / UI / IO
+ilastik/applets/cropping/croppingDrawer.ui,Plumbing / UI / IO
+ilastik/applets/cropping/croppingGui.py,Plumbing / UI / IO
+ilastik/applets/cropping/croppingSerializer.py,Plumbing / UI / IO
+ilastik/applets/cropping/croppingSingleLaneApplet.py,Plumbing / UI / IO
+ilastik/applets/cropping/opCropping.py,Core Capabilities
+ilastik/applets/cropping/opCropSelection.py,Core Capabilities
+ilastik/applets/dataExport/__init__.py,Plumbing / UI / IO
+ilastik/applets/dataExport/dataExport.ui,Plumbing / UI / IO
+ilastik/applets/dataExport/dataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/dataExport/dataExportDrawer.ui,Plumbing / UI / IO
+ilastik/applets/dataExport/dataExportGui.py,Plumbing / UI / IO
+ilastik/applets/dataExport/dataExportSerializer.py,Plumbing / UI / IO
+ilastik/applets/dataExport/opDataExport.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/__init__.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/addFileButton.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/axistagsEditorWidget.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataLaneSummaryTableModel.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataLaneSummaryTableView.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataSelection.ui,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataSelectionApplet.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataSelectionDrawer.ui,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataSelectionGui.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/dataSelectionSerializer.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/datasetDetailedInfoTableModel.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/datasetDetailedInfoTableView.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/datasetInfoEditorWidget.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/datasetInfoEditorWidget.ui,Plumbing / UI / IO
+ilastik/applets/dataSelection/dvidDataSelectionBrowser.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/multiscaleDatasetBrowser.py,Plumbing / UI / IO
+ilastik/applets/dataSelection/opDataSelection.py,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/__init__.py,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/deviationFromMeanApplet.py,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/deviationFromMeanGui.py,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/deviationFromMeanSerializer.py,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/drawer.ui,Plumbing / UI / IO
+ilastik/applets/deviationFromMean/opDeviationFromMean.py,Core Capabilities
+ilastik/applets/edgeTraining/__init__.py,Plumbing / UI / IO
+ilastik/applets/edgeTraining/edgeTrainingApplet.py,Plumbing / UI / IO
+ilastik/applets/edgeTraining/edgeTrainingGui.py,Plumbing / UI / IO
+ilastik/applets/edgeTraining/edgeTrainingSerializer.py,Plumbing / UI / IO
+ilastik/applets/edgeTraining/opEdgeTraining.py,Core Capabilities
+ilastik/applets/edgeTraining/simpleEdgeFeatureSelection.py,Core Capabilities
+ilastik/applets/edgeTraining/util.py,Plumbing / UI / IO
+ilastik/applets/edgeTrainingWithMulticut/__init__.py,Plumbing / UI / IO
+ilastik/applets/edgeTrainingWithMulticut/edgeTrainingWithMulticutApplet.py,Plumbing / UI / IO
+ilastik/applets/edgeTrainingWithMulticut/edgeTrainingWithMulticutGui.py,Plumbing / UI / IO
+ilastik/applets/edgeTrainingWithMulticut/opEdgeTrainingWithMulticut.py,Core Capabilities
+ilastik/applets/featureSelection/__init__.py,Plumbing / UI / IO
+ilastik/applets/featureSelection/centralWidget.ui,Plumbing / UI / IO
+ilastik/applets/featureSelection/featureSelectionApplet.py,Plumbing / UI / IO
+ilastik/applets/featureSelection/featureSelectionDrawer.ui,Plumbing / UI / IO
+ilastik/applets/featureSelection/featureSelectionGui.py,Plumbing / UI / IO
+ilastik/applets/featureSelection/featureSelectionSerializer.py,Plumbing / UI / IO
+ilastik/applets/featureSelection/opFeatureSelection.py,Core Capabilities
+ilastik/applets/featureSelection/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/__init__.py,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/drawer.ui,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/fillMissingSlicesApplet.py,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/fillMissingSlicesGui.py,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/fillMissingSlicesSerializer.py,Plumbing / UI / IO
+ilastik/applets/fillMissingSlices/opFillMissingSlices.py,Core Capabilities
+ilastik/applets/labelImageViewer/__init__.py,Plumbing / UI / IO
+ilastik/applets/labelImageViewer/labelImageViewerApplet.py,Plumbing / UI / IO
+ilastik/applets/labelImageViewer/labelImageViewerGui.py,Plumbing / UI / IO
+ilastik/applets/labelImageViewer/opLabelImageViewer.py,Core Capabilities
+ilastik/applets/labeling/__init__.py,Plumbing / UI / IO
+ilastik/applets/labeling/dataImportOptionsDlg.ui,Plumbing / UI / IO
+ilastik/applets/labeling/labelingApplet.py,Plumbing / UI / IO
+ilastik/applets/labeling/labelingDrawer.ui,Plumbing / UI / IO
+ilastik/applets/labeling/labelingGui.py,Plumbing / UI / IO
+ilastik/applets/labeling/labelingImport.py,Plumbing / UI / IO
+ilastik/applets/labeling/labelingSerializer.py,Plumbing / UI / IO
+ilastik/applets/labeling/labelingSingleLaneApplet.py,Plumbing / UI / IO
+ilastik/applets/labeling/opLabeling.py,Core Capabilities
+ilastik/applets/labeling/icons/*,Plumbing / UI / IO
+ilastik/applets/layerViewer/__init__.py,Plumbing / UI / IO
+ilastik/applets/layerViewer/centralWidget.ui,Plumbing / UI / IO
+ilastik/applets/layerViewer/drawer.ui,Plumbing / UI / IO
+ilastik/applets/layerViewer/layerViewerApplet.py,Plumbing / UI / IO
+ilastik/applets/layerViewer/layerViewerGui.py,Plumbing / UI / IO
+ilastik/applets/layerViewer/menu.ui,Plumbing / UI / IO
+ilastik/applets/layerViewer/opLayerViewer.py,Core Capabilities
+ilastik/applets/multicut/__init__.py,Plumbing / UI / IO
+ilastik/applets/multicut/multicutApplet.py,Plumbing / UI / IO
+ilastik/applets/multicut/multicutGui.py,Plumbing / UI / IO
+ilastik/applets/multicut/multicutLegacy.py,Plumbing / UI / IO
+ilastik/applets/multicut/multicutSerializer.py,Plumbing / UI / IO
+ilastik/applets/multicut/opMulticut.py,Core Capabilities
+ilastik/applets/neuralNetwork/__init__.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/bioimageiodl.py,Core Capabilities
+ilastik/applets/neuralNetwork/modelStateControl.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClass.ui,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassApplet.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassDrawer.ui,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassGui.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassSerializer.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassificationDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/nnClassificationDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/opNNClassificationDataExport.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/opNNclass.py,Core Capabilities
+ilastik/applets/neuralNetwork/tiktorchController.py,Core Capabilities
+ilastik/applets/neuralNetwork/tiktorchWizard.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/types.py,Plumbing / UI / IO
+ilastik/applets/neuralNetwork/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/objectClassification/__init__.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/drawer.ui,Plumbing / UI / IO
+ilastik/applets/objectClassification/exportToKnimeDialog.ui,Plumbing / UI / IO
+ilastik/applets/objectClassification/labelingDrawer.ui,Plumbing / UI / IO
+ilastik/applets/objectClassification/labelingDrawer.ui.old,Plumbing / UI / IO
+ilastik/applets/objectClassification/objectClassificationApplet.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/objectClassificationDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/objectClassificationDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/objectClassificationGui.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/objectClassificationSerializer.py,Plumbing / UI / IO
+ilastik/applets/objectClassification/opObjectClassification.py,Core Capabilities
+ilastik/applets/objectExtraction/__init__.py,Plumbing / UI / IO
+ilastik/applets/objectExtraction/config.py,Plumbing / UI / IO
+ilastik/applets/objectExtraction/drawer.ui,Plumbing / UI / IO
+ilastik/applets/objectExtraction/featureSelection.ui,Plumbing / UI / IO
+ilastik/applets/objectExtraction/featureSelectionWithHelp.ui,Plumbing / UI / IO
+ilastik/applets/objectExtraction/objectExtractionApplet.py,Plumbing / UI / IO
+ilastik/applets/objectExtraction/objectExtractionGui.py,Plumbing / UI / IO
+ilastik/applets/objectExtraction/objectExtractionSerializer.py,Plumbing / UI / IO
+ilastik/applets/objectExtraction/opObjectExtraction.py,Core Capabilities
+ilastik/applets/pixelClassification/__init__.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/centralWidget.ui,Plumbing / UI / IO
+ilastik/applets/pixelClassification/labelingDrawer.ui,Plumbing / UI / IO
+ilastik/applets/pixelClassification/labelingDrawer_reference.ui,Plumbing / UI / IO
+ilastik/applets/pixelClassification/opPixelClassification.py,Core Capabilities
+ilastik/applets/pixelClassification/opPixelClassificationDataExport.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/opSimplePixelClassification.py,Core Capabilities
+ilastik/applets/pixelClassification/pixelClassificationApplet.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/pixelClassificationDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/pixelClassificationDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/pixelClassificationGui.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/pixelClassificationSerializer.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/selectFeaturesDlg.ui,Plumbing / UI / IO
+ilastik/applets/pixelClassification/suggestFeaturesDialog.py,Plumbing / UI / IO
+ilastik/applets/pixelClassification/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/predictionViewer/__init__.py,Plumbing / UI / IO
+ilastik/applets/predictionViewer/opPredictionViewer.py,Core Capabilities
+ilastik/applets/predictionViewer/predictionViewerApplet.py,Plumbing / UI / IO
+ilastik/applets/predictionViewer/predictionViewerGui.py,Plumbing / UI / IO
+ilastik/applets/predictionViewer/predictionViewerSerializer.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/__init__.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/configStorage.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/opServerConfig.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigApplet.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigDrawer.ui,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigForm.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigForm.ui,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigGui.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverConfigSerializer.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/serverListWidget.py,Plumbing / UI / IO
+ilastik/applets/serverConfiguration/types.py,Plumbing / UI / IO
+ilastik/applets/thresholdMasking/__init__.py,Plumbing / UI / IO
+ilastik/applets/thresholdMasking/drawer.ui,Plumbing / UI / IO
+ilastik/applets/thresholdMasking/opThresholdMasking.py,Core Capabilities
+ilastik/applets/thresholdMasking/thresholdMaskingApplet.py,Plumbing / UI / IO
+ilastik/applets/thresholdMasking/thresholdMaskingGui.py,Plumbing / UI / IO
+ilastik/applets/thresholdMasking/thresholdMaskingSerializer.py,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/__init__.py,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/_OpGraphCut.py,Core Capabilities
+ilastik/applets/thresholdTwoLevels/_OpObjectsSegment.py,Core Capabilities
+ilastik/applets/thresholdTwoLevels/drawer.ui,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/ipht.py,Core Capabilities
+ilastik/applets/thresholdTwoLevels/opGraphcutSegment.py,Core Capabilities
+ilastik/applets/thresholdTwoLevels/opThresholdTwoLevels.py,Core Capabilities
+ilastik/applets/thresholdTwoLevels/thresholdTwoLevelsApplet.py,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/thresholdTwoLevelsGui.py,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/thresholdTwoLevelsSerializer.py,Plumbing / UI / IO
+ilastik/applets/thresholdTwoLevels/thresholdingTools.py,Core Capabilities
+ilastik/applets/tracking/annotations/__init__.py,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/annotationsApplet.py,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/annotationsGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/annotationsSerializer.py,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/drawer.ui,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/drawerObjects.ui,Plumbing / UI / IO
+ilastik/applets/tracking/annotations/opAnnotations.py,Core Capabilities
+ilastik/applets/tracking/annotations/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/tracking/base/__init__.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/opTrackingBaseDataExport.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/pluginExportOptionsDlg.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/pluginExportOptionsDlg.ui,Plumbing / UI / IO
+ilastik/applets/tracking/base/trackingBaseDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/trackingBaseDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/trackingBaseGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/trackingSerializer.py,Plumbing / UI / IO
+ilastik/applets/tracking/base/trackingUtilities.py,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/__init__.py,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/config.py,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/conservationTrackingApplet.py,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/conservationTrackingGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/drawer.ui,Plumbing / UI / IO
+ilastik/applets/tracking/conservation/opConservationTracking.py,Core Capabilities
+ilastik/applets/tracking/conservation/opRelabeledMergerFeatureExtraction.py,Core Capabilities
+ilastik/applets/tracking/manual/__init__.py,Plumbing / UI / IO
+ilastik/applets/tracking/manual/drawer.ui,Plumbing / UI / IO
+ilastik/applets/tracking/manual/manualTrackingApplet.py,Plumbing / UI / IO
+ilastik/applets/tracking/manual/manualTrackingGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/manual/manualTrackingSerializer.py,Plumbing / UI / IO
+ilastik/applets/tracking/manual/opManualTracking.py,Core Capabilities
+ilastik/applets/tracking/manual/viewerControls.ui,Plumbing / UI / IO
+ilastik/applets/tracking/structured/__init__.py,Plumbing / UI / IO
+ilastik/applets/tracking/structured/drawer.ui,Plumbing / UI / IO
+ilastik/applets/tracking/structured/opStructuredTracking.py,Core Capabilities
+ilastik/applets/tracking/structured/structuredTrackingApplet.py,Plumbing / UI / IO
+ilastik/applets/tracking/structured/structuredTrackingGui.py,Plumbing / UI / IO
+ilastik/applets/tracking/structured/structuredTrackingSerializer.py,Plumbing / UI / IO
+ilastik/applets/trackingFeatureExtraction/__init__.py,Plumbing / UI / IO
+ilastik/applets/trackingFeatureExtraction/config.py,Plumbing / UI / IO
+ilastik/applets/trackingFeatureExtraction/opTrackingFeatureExtraction.py,Core Capabilities
+ilastik/applets/trackingFeatureExtraction/trackingFeatureExtractionApplet.py,Plumbing / UI / IO
+ilastik/applets/trackingFeatureExtraction/trackingFeatureExtractionSerializer.py,Plumbing / UI / IO
+ilastik/applets/trackingFeatureExtraction/trackingFeatures.py,Core Capabilities
+ilastik/applets/trainableDomainAdaptation/__init__.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/modelStateControl.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/opTrainableDomainAdaptation.py,Core Capabilities
+ilastik/applets/trainableDomainAdaptation/tdaDataExportApplet.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/tdaDataExportGui.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/tiktorchController.py,Core Capabilities
+ilastik/applets/trainableDomainAdaptation/trainableDomainAdaptationApplet.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/trainableDomainAdaptationGui.py,Plumbing / UI / IO
+ilastik/applets/trainableDomainAdaptation/trainableDomainAdaptationSerializer.py,Plumbing / UI / IO
+ilastik/applets/wsdt/__init__.py,Plumbing / UI / IO
+ilastik/applets/wsdt/opWsdt.py,Core Capabilities
+ilastik/applets/wsdt/wsdtApplet.py,Plumbing / UI / IO
+ilastik/applets/wsdt/wsdtGui.py,Plumbing / UI / IO
+ilastik/applets/wsdt/wsdtSerializer.py,Plumbing / UI / IO
+ilastik/experimental/*,Plumbing / UI / IO
+ilastik/ilastik_logging/*,Plumbing / UI / IO
+ilastik/plugins/manager.py,Plumbing / UI / IO
+ilastik/plugins/types.py,Plumbing / UI / IO
+ilastik/plugins_default/convex_hull_feature_description.py,Core Capabilities
+ilastik/plugins_default/test_objfeats.py,Plumbing / UI / IO
+ilastik/plugins_default/tracking_*_export.py,Plumbing / UI / IO
+ilastik/plugins_default/vigra_objfeats*.py,Core Capabilities
+ilastik/shell/gui/*.py,Plumbing / UI / IO
+ilastik/shell/gui/*.ui,Plumbing / UI / IO
+ilastik/shell/gui/icons/*,Plumbing / UI / IO
+ilastik/shell/headless/*.py,Plumbing / UI / IO
+ilastik/utility/*.py,Plumbing / UI / IO
+ilastik/utility/gui/*.py,Plumbing / UI / IO
+ilastik/widgets/*.py,Plumbing / UI / IO
+ilastik/widgets/*.ui,Plumbing / UI / IO
+ilastik/workflows/*/*Workflow.py,Plumbing / UI / IO
+ilastik/workflows/carving/opCarving.py,Core Capabilities
+ilastik/workflows/carving/opPreprocessing.py,Core Capabilities
+ilastik/workflows/carving/carvingTools.py,Core Capabilities
+ilastik/workflows/carving/watershed_segmentor.py,Core Capabilities
+ilastik/workflows/voxelSegmentation/opVoxelSegmentation.py,Core Capabilities
+ilastik/workflows/voxelSegmentation/opSlic.py,Core Capabilities
+ilastik/workflows/voxelSegmentation/classifierOperators.py,Core Capabilities
+ilastik/workflows/voxelSegmentation/features.py,Core Capabilities
+ilastik/workflows/voxelSegmentation/superVoxelSinkSource.py,Core Capabilities`;
+
+        // --- DATA PROCESSING ---
+        // 1. Parse CSV
+        const rows = csvData.trim().split('\n').slice(1).filter(r => r.length > 0);
+        const dataList = rows.map(r => {
+            const idx = r.lastIndexOf(',');
+            return {
+                path: r.substring(0, idx).trim(),
+                category: r.substring(idx + 1).trim()
+            };
+        });
+
+        // 2. Prep data for Stacked Bar Chart
+        const moduleStats = {};
+        dataList.forEach(({path, category}) => {
+            const parts = path.split('/');
+            // Get top level module after 'ilastik/'
+            let mod = parts.length > 1 ? parts[1] : 'root';
+            if (mod.includes('.')) mod = 'root'; // direct files
+
+            if (!moduleStats[mod]) moduleStats[mod] = { core: 0, plumb: 0 };
+            if (category === 'Core Capabilities') moduleStats[mod].core++;
+            else moduleStats[mod].plumb++;
+        });
+
+        // Sort by total files descending for better visual flow
+        const sortedModules = Object.entries(moduleStats).sort((a, b) => 
+            (b[1].core + b[1].plumb) - (a[1].core + a[1].plumb)
+        );
+
+        const barX = sortedModules.map(m => m[0]);
+        const barCore = sortedModules.map(m => m[1].core);
+        const barPlumb = sortedModules.map(m => m[1].plumb);
+
+        // 3. Prep data for Hierarchy (Treemap & Sunburst)
+        const nodeMap = new Map();
+
+        dataList.forEach(({path, category}) => {
+            const parts = path.split('/');
+            let currentPath = '';
+            
+            for (let i = 0; i < parts.length; i++) {
+                const parentPath = currentPath;
+                currentPath = currentPath ? currentPath + '/' + parts[i] : parts[i];
+
+                if (!nodeMap.has(currentPath)) {
+                    nodeMap.set(currentPath, {
+                        label: parts[i],
+                        parent: parentPath,
+                        isLeaf: i === parts.length - 1,
+                        totalCount: 0,
+                        coreCount: 0
+                    });
+                } else if (i === parts.length - 1) {
+                    nodeMap.get(currentPath).isLeaf = true;
+                }
+
+                const node = nodeMap.get(currentPath);
+                node.totalCount += 1; // Accumulate files under this directory
+                if (category === 'Core Capabilities') {
+                    node.coreCount += 1; // Accumulate core files under this directory
+                }
+            }
+        });
+
+        // Flatten to Plotly format arrays
+        const ids = [];
+        const labels = [];
+        const parents = [];
+        const values = [];     // Leave nodes = 1, parents = 0 (Plotly aggregates automatically)
+        const colors = [];     // Calculated Core density ratio
+        const hoverTexts = []; // Custom hover data
+
+        for (const [id, info] of nodeMap.entries()) {
+            ids.push(id);
+            labels.push(info.label);
+            parents.push(info.parent);
+            values.push(info.isLeaf ? 1 : 0); 
+            
+            // Core density (0.0 to 1.0)
+            const density = info.totalCount > 0 ? (info.coreCount / info.totalCount) : 0;
+            colors.push(density);
+            
+            // Build nice tooltip text
+            const plumbCount = info.totalCount - info.coreCount;
+            const text = `<b>Total Files: ${info.totalCount}</b><br><span style='color:#3b82f6'>■ Core: ${info.coreCount}</span><br><span style='color:#6b7280'>■ Plumbing: ${plumbCount}</span>`;
+            hoverTexts.push(text);
+        }
+
+        // --- PLOTLY RENDERING ---
+
+        // Config to remove annoying modebar options
+        const plotConfig = { responsive: true, displayModeBar: false };
+        const fontConfig = { family: 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' };
+
+        // 1. Stacked Bar Chart
+        const traceCoreBar = {
+            x: barX, y: barCore,
+            name: 'Core',
+            type: 'bar',
+            marker: { color: '#3b82f6', line: { width: 0 } },
+            hovertemplate: '%{x}<br>Core: <b>%{y}</b> files<extra></extra>'
+        };
+        const tracePlumbBar = {
+            x: barX, y: barPlumb,
+            name: 'Plumbing',
+            type: 'bar',
+            marker: { color: '#d1d5db', line: { width: 0 } },
+            hovertemplate: '%{x}<br>Plumbing: <b>%{y}</b> files<extra></extra>'
+        };
+
+        const layoutBar = {
+            barmode: 'stack',
+            margin: { t: 20, l: 40, r: 20, b: 60 },
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent',
+            font: fontConfig,
+            showlegend: false, // Managed by our HTML header
+            xaxis: { 
+                tickangle: -45, 
+                fixedrange: true, // Disable zoom for cleaner UI
+                gridcolor: '#f1f5f9'
+            },
+            yaxis: { 
+                fixedrange: true,
+                gridcolor: '#e2e8f0'
+            }
+        };
+        Plotly.newPlot('bar-chart', [traceCoreBar, tracePlumbBar], layoutBar, plotConfig);
+
+        // 2. Sunburst Chart
+        const traceSunburst = {
+            type: "sunburst",
+            ids: ids,
+            labels: labels,
+            parents: parents,
+            values: values,
+            text: hoverTexts,
+            textinfo: "label",
+            hoverinfo: "text",
+            branchvalues: 'remainder',
+            marker: {
+                colors: colors,
+                colorscale: [[0, '#d1d5db'], [1, '#2563eb']],
+                line: { width: 1, color: '#ffffff' }
+            }
+        };
+
+        const layoutSunburst = {
+            margin: { t: 10, l: 10, r: 10, b: 10 },
+            paper_bgcolor: 'transparent',
+            font: fontConfig
+        };
+        Plotly.newPlot('sunburst-chart', [traceSunburst], layoutSunburst, plotConfig);
+
+        // 3. Treemap Chart
+        const traceTreemap = {
+            type: "treemap",
+            ids: ids,
+            labels: labels,
+            parents: parents,
+            values: values,
+            text: hoverTexts,
+            textinfo: "label+percent parent",
+            hoverinfo: "label+text",
+            branchvalues: 'remainder',
+            marker: {
+                colors: colors,
+                colorscale: [[0, '#d1d5db'], [0.4, '#9ca3af'], [1, '#2563eb']], // Weighted slightly for contrast
+                showscale: true,
+                colorbar: {
+                    title: { text: 'Core<br>Density', font: {size: 11, color: '#64748b'} },
+                    thickness: 15,
+                    len: 0.8,
+                    tickvals: [0, 1],
+                    ticktext: ['100% UI', '100% Core'],
+                    tickfont: {color: '#64748b'}
+                },
+                line: { width: 1.5, color: '#ffffff' }
+            },
+            pathbar: {
+                visible: true,
+                textfont: { size: 12, color: '#475569' }
+            }
+        };
+
+        const layoutTreemap = {
+            margin: { t: 0, l: 0, r: 0, b: 0 },
+            paper_bgcolor: 'transparent',
+            font: fontConfig
+        };
+        Plotly.newPlot('treemap-chart', [traceTreemap], layoutTreemap, plotConfig);
+
+    </script>
+</body>
+</html>

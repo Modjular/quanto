@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Ilastik Prototype</title>
+    <style>
+        body { font-family: sans-serif; background: #222; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        #controls { padding: 10px; background: #333; border-bottom: 1px solid #444; display: flex; gap: 10px; align-items: center; }
+        #viewport {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #111;
+        }
+        canvas {
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            max-width: 90%;
+            max-height: 90%;
+        }
+    </style>
+</head>
+<body>
+
+<div id="controls">
+    <h3>WebGPU Ilastik</h3>
+    <input type="file" id="fileInput" accept=".tif,.tiff">
+    <div id="featureControls" style="display:none; gap:10px; align-items:center;">
+        <div style="border-right:1px solid #666; padding-right:10px;">
+            <label>Sigma: <span id="sigmaDisplay">1.0</span></label>
+            <input type="range" id="sigmaRange" min="0.5" max="10.0" step="0.1" value="1.0">
+        </div>
+        
+        <div>
+            Analyzing: 
+            <button id="btnClass1" style="background:red; color:white; border:2px solid white;">Class 1</button>
+            <button id="btnClass2" style="background:#444; color:white; border:1px solid #666;">Class 2</button>
+            <label>Size: <input type="number" id="brushSize" value="5" min="1" max="50" style="width:40px;"></label>
+            <button id="btnTrain">Train (Pseudo)</button>
+        </div>
+    </div>
+
+    <span id="status" style="margin-left:auto; color:#aaa; font-size:0.9em;">No image loaded</span>
+</div>
+
+
+
+<div id="viewport" style="position:relative;">
+    <canvas id="gpuCanvas" style="position:absolute; top:0; left:0; pointer-events:none;"></canvas>
+    <canvas id="labelCanvas" style="position:absolute; top:0; left:0; cursor:crosshair; touch-action:none;"></canvas>
+</div>
+
+<!-- Load generic UTIF library -->
+<script src="utif.js"></script>
+
+<script>
+    const fileInput = document.getElementById('fileInput');
+    const statusSpan = document.getElementById('status');
+    const canvas = document.getElementById('gpuCanvas');
+
+    // Display Shader (Vertex + Fragment)
+    const DISPLAY_SHADER = `
+        struct VertexOutput {
+            @builtin(position) Position : vec4<f32>,
+            @location(0) uv : vec2<f32>,
+        }
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) VertexIndex : u32) -> VertexOutput {
+            var pos = array<vec2<f32>, 4>(
+                vec2<f32>(-1.0, 1.0),
+                vec2<f32>(1.0, 1.0),
+                vec2<f32>(-1.0, -1.0),
+                vec2<f32>(1.0, -1.0)
+            );
+            var uvs = array<vec2<f32>, 4>(
+                vec2<f32>(0.0, 0.0),
+                vec2<f32>(1.0, 0.0),
+                vec2<f32>(0.0, 1.0),
+                vec2<f32>(1.0, 1.0)
+            );
+
+            var output : VertexOutput;
+            output.Position = vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+            output.uv = uvs[VertexIndex];
+            return output;
+        }
+
+        @group(0) @binding(0) var mySampler : sampler;
+        @group(0) @binding(1) var myTexture : texture_2d<f32>;
+
+        @fragment
+        fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+            return textureSample(myTexture, mySampler, uv);
+        }
+    `;
+
+    // 1D Gaussian Compute Shader
+    const GAUSSIAN_SHADER = `
+        struct Params {
+            direction: vec2<i32>,
+            kernelSize: i32,
+            padding: i32,
+            weights: array<f32, 32>, // Max kernel radius 15 (size 31) + padding
+        }
+
+        @group(0) @binding(0) var inputTex : texture_2d<f32>;
+        @group(0) @binding(1) var outputTex : texture_storage_2d<rgba8unorm, write>;
+        @group(0) @binding(2) var<uniform> params : Params;
+
+        @compute @workgroup_size(16, 16)
+        fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+            let dims = textureDimensions(inputTex);
+            let coord = vec2<i32>(global_id.xy);
+
+            if (coord.x >= i32(dims.x) || coord.y >= i32(dims.y)) {
+                return;
+            }
+
+            var result = vec4<f32>(0.0);
+            let radius = params.kernelSize / 2;
+            let dir = params.direction;
+
+            for (var i = -radius; i <= radius; i++) {
+                let offset = dir * i;
+                let sampleCoord = coord + offset;
+                
+                // Clamp to edge (simple boundary condition)
+                let clampedCoord = vec2<i32>(
+                    clamp(sampleCoord.x, 0, i32(dims.x) - 1),
+                    clamp(sampleCoord.y, 0, i32(dims.y) - 1)
+                );
+
+                let weight = params.weights[i + radius];
+                let val = textureLoad(inputTex, clampedCoord, 0);
+                result += val * weight;
+            }
+
+            textureStore(outputTex, coord, result);
+        }
+    `;
+
+    async function initWebGPU() {
+        if (!navigator.gpu) throw new Error("WebGPU not supported");
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+        const context = canvas.getContext('webgpu');
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        
+        context.configure({
+            device: device,
+            format: format,
+            alphaMode: 'opaque'
+        });
+
+        return { device, context, format };
+    }
+
+    let gpuState = null;
+    let originalTexture = null;
+    let smoothedTexture = null;
+    let tempTexture = null; // Ping-pong
+    let loadedWidth = 0;
+    let loadedHeight = 0;
+
+    (async () => {
+        try {
+            gpuState = await initWebGPU();
+            console.log("WebGPU Initialized");
+        } catch (e) {
+            statusSpan.textContent = "WebGPU Failed: " + e.message;
+        }
+    })();
+
+    // Compute Shader Helper
+    function createComputePipeline(device, shaderCode) {
+        return device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: device.createShaderModule({ code: shaderCode }),
+                entryPoint: 'main',
+            },
+        });
+    }
+
+    // Generate Gaussian Weights
+    function getGaussianWeights(sigma) {
+        const radius = Math.ceil(3 * sigma);
+        const kernelSize = 2 * radius + 1;
+        const weights = new Float32Array(32); // Must match shader struct size
+        let sum = 0;
+        for (let i = 0; i < kernelSize; i++) {
+            const x = i - radius;
+            const w = Math.exp(-(x*x) / (2 * sigma * sigma));
+            weights[i] = w;
+            sum += w;
+        }
+        // Normalize
+        for (let i = 0; i < kernelSize; i++) {
+            weights[i] /= sum;
+        }
+        return { weights, kernelSize };
+    }
+
+    async function runGaussian(sigma) {
+        if (!gpuState || !originalTexture) return;
+        const { device } = gpuState;
+        
+        const { weights, kernelSize } = getGaussianWeights(sigma);
+
+        // Uniform Buffer (Params) - need to update for each pass (direction)
+        const paramsBufferSize = 16 + 128; // 4 ints (16 bytes) + 32 floats (128 bytes)
+        const paramsBuffer = device.createBuffer({
+            size: paramsBufferSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        // Pipeline
+        const pipeline = createComputePipeline(device, GAUSSIAN_SHADER);
+        
+        // Pass 1: Horizontal (Original -> Temp)
+        const bindGroup1 = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: originalTexture.createView() },
+                { binding: 1, resource: tempTexture.createView() },
+                { binding: 2, resource: { buffer: paramsBuffer } },
+            ],
+        });
+
+        // Write Params for Horizontal Pass (1, 0)
+        let paramData = new ArrayBuffer(paramsBufferSize);
+        let intView = new Int32Array(paramData);
+        let floatView = new Float32Array(paramData);
+        
+        intView[0] = 1; intView[1] = 0; // direction
+        intView[2] = kernelSize;
+        intView[3] = 0; // padding
+        floatView.set(weights, 4); // weights start at offset 16 (4 floats)
+
+        device.queue.writeBuffer(paramsBuffer, 0, paramData);
+
+        const commandEncoder = device.createCommandEncoder();
+        const pass1 = commandEncoder.beginComputePass();
+        pass1.setPipeline(pipeline);
+        pass1.setBindGroup(0, bindGroup1);
+        pass1.dispatchWorkgroups(Math.ceil(loadedWidth / 16), Math.ceil(loadedHeight / 16));
+        pass1.end();
+
+        // Pass 2: Vertical (Temp -> Smoothed)
+        // Need to update direction in params buffer. 
+        // Ideally we use a second buffer or dynamic offset, but for now just write again (slower but simple).
+        // Actually, we can just issue a writeBuffer command in the same queue? 
+        // No, queue writes happen before command execution. We need separate submits or separate buffers.
+        // Let's create a second buffer for pass 2 to be safe and easy.
+        
+        const paramsBuffer2 = device.createBuffer({
+            size: paramsBufferSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        
+        intView[0] = 0; intView[1] = 1; // direction (0, 1)
+        device.queue.writeBuffer(paramsBuffer2, 0, paramData);
+
+        const bindGroup2 = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: tempTexture.createView() }, // Input is Temp
+                { binding: 1, resource: smoothedTexture.createView() }, // Output is Smoothed
+                { binding: 2, resource: { buffer: paramsBuffer2 } },
+            ],
+        });
+
+        const pass2 = commandEncoder.beginComputePass();
+        pass2.setPipeline(pipeline);
+        pass2.setBindGroup(0, bindGroup2);
+        pass2.dispatchWorkgroups(Math.ceil(loadedWidth / 16), Math.ceil(loadedHeight / 16));
+        pass2.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+        
+        renderTexture(smoothedTexture);
+    }
+
+    function renderTexture(tex) {
+        if (!gpuState) return;
+        const { device, context, format } = gpuState;
+
+        const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: device.createShaderModule({ code: DISPLAY_SHADER }),
+                entryPoint: 'vs_main',
+            },
+            fragment: {
+                module: device.createShaderModule({ code: DISPLAY_SHADER }),
+                entryPoint: 'fs_main',
+                targets: [{ format: format }],
+            },
+            primitive: { topology: 'triangle-strip' },
+        });
+
+        const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: sampler },
+                { binding: 1, resource: tex.createView() },
+            ],
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        const textureView = context.getCurrentTexture().createView();
+        const renderPass = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+                view: textureView,
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                loadOp: 'clear',
+                storeOp: 'store',
+            }],
+        });
+        renderPass.setPipeline(pipeline);
+        renderPass.setBindGroup(0, bindGroup);
+        renderPass.draw(4);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+    }
+
+    // ... Global State ...
+    let currentClass = 1;
+    let isDrawing = false;
+    const labels = new Map(); // Key: "x,y", Value: classId
+    const labelCanvas = document.getElementById('labelCanvas');
+    const labelCtx = labelCanvas.getContext('2d');
+    
+    // UI Helpers
+    const btnClass1 = document.getElementById('btnClass1');
+    const btnClass2 = document.getElementById('btnClass2');
+
+    function setActiveClass(c) {
+        currentClass = c;
+        btnClass1.style.border = c === 1 ? '2px solid white' : '1px solid #666';
+        btnClass1.style.background = c === 1 ? 'red' : '#500';
+        btnClass2.style.border = c === 2 ? '2px solid white' : '1px solid #666';
+        btnClass2.style.background = c === 2 ? 'green' : '#050';
+    }
+
+    if(btnClass1 && btnClass2) {
+        btnClass1.onclick = () => setActiveClass(1);
+        btnClass2.onclick = () => setActiveClass(2);
+    }
+
+    // Drawing Logic
+    function getMousePos(canvas, evt) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: Math.floor((evt.clientX - rect.left) * (canvas.width / rect.width)),
+            y: Math.floor((evt.clientY - rect.top) * (canvas.height / rect.height))
+        };
+    }
+
+    function draw(evt) {
+        if (!isDrawing) return;
+        const pos = getMousePos(labelCanvas, evt);
+        const sizeInput = document.getElementById('brushSize');
+        const size = sizeInput ? parseInt(sizeInput.value) : 5;
+        
+        labelCtx.fillStyle = currentClass === 1 ? 'rgba(255, 0, 0, 0.5)' : 'rgba(0, 255, 0, 0.5)';
+        labelCtx.beginPath();
+        labelCtx.arc(pos.x, pos.y, size, 0, Math.PI * 2);
+        labelCtx.fill();
+
+        // Store Labels (Sparse)
+        const r = size;
+        const r2 = r*r;
+        for(let dy = -r; dy <= r; dy++) {
+            for(let dx = -r; dx <= r; dx++) {
+                if(dx*dx + dy*dy <= r2) {
+                    const lx = pos.x + dx;
+                    const ly = pos.y + dy;
+                    if(lx >= 0 && lx < labelCanvas.width && ly >= 0 && ly < labelCanvas.height) {
+                        labels.set(`${lx},${ly}`, currentClass);
+                    }
+                }
+            }
+        }
+    }
+
+    labelCanvas.addEventListener('mousedown', (e) => { isDrawing = true; draw(e); });
+    labelCanvas.addEventListener('mousemove', draw);
+    labelCanvas.addEventListener('mouseup', () => isDrawing = false);
+    labelCanvas.addEventListener('mouseout', () => isDrawing = false);
+
+    // Prediction Shader (Nearest Centroid)
+    const PREDICTION_SHADER = `
+        struct Params {
+            centroid1: vec4<f32>,
+            centroid2: vec4<f32>,
+        }
+
+        @group(0) @binding(0) var mySampler : sampler;
+        @group(0) @binding(1) var myTexture : texture_2d<f32>;
+        @group(0) @binding(2) var<uniform> params : Params;
+
+        @fragment
+        fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+            let feature = textureSample(myTexture, mySampler, uv);
+            
+            let dist1 = distance(feature, params.centroid1);
+            let dist2 = distance(feature, params.centroid2);
+
+            if (dist1 < dist2) {
+                return vec4<f32>(1.0, 0.0, 0.0, 0.6); // Class 1: Red overlay
+            } else {
+                return vec4<f32>(0.0, 1.0, 0.0, 0.6); // Class 2: Green overlay
+            }
+        }
+        
+        @vertex
+        fn vs_main(@builtin(vertex_index) VertexIndex : u32) -> VertexOutput {
+             var pos = array<vec2<f32>, 4>(
+                vec2<f32>(-1.0, 1.0),
+                vec2<f32>(1.0, 1.0),
+                vec2<f32>(-1.0, -1.0),
+                vec2<f32>(1.0, -1.0)
+            );
+            var uvs = array<vec2<f32>, 4>(
+                vec2<f32>(0.0, 0.0),
+                vec2<f32>(1.0, 0.0),
+                vec2<f32>(0.0, 1.0),
+                vec2<f32>(1.0, 1.0)
+            );
+
+            var output : VertexOutput;
+            output.Position = vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+            output.uv = uvs[VertexIndex];
+            return output;
+        }
+        
+        struct VertexOutput {
+            @builtin(position) Position : vec4<f32>,
+            @location(0) uv : vec2<f32>,
+        }
+    `;
+
+    // ... (Previous Helper Functions) ...
+
+    async function readPixelsFromGPU(texture, width, height) {
+        if (!gpuState) return null;
+        const { device } = gpuState;
+
+        // Bytes per row must be multiple of 256
+        const bytesPerPixel = 4;
+        const unpaddedBytesPerRow = width * bytesPerPixel;
+        const paddedBytesPerRow = Math.ceil(unpaddedBytesPerRow / 256) * 256;
+
+        const buffer = device.createBuffer({
+            size: paddedBytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        commandEncoder.copyTextureToBuffer(
+            { texture: texture },
+            { buffer: buffer, bytesPerRow: paddedBytesPerRow },
+            { width, height }
+        );
+        device.queue.submit([commandEncoder.finish()]);
+
+        await buffer.mapAsync(GPUMapMode.READ);
+        const arrayBuffer = buffer.getMappedRange();
+        
+        // We need to unpad the rows
+        const result = new Float32Array(width * height * 4); // Treating as float for simplicity logic, but data is uint8... wait texture is rgba8unorm?
+        // Ah, copyTextureToBuffer gives raw bytes. If format is rgba8unorm, we get uint8.
+        const rawData = new Uint8Array(arrayBuffer);
+        
+        // Unpad
+        for(let y=0; y<height; y++) {
+            for(let x=0; x<width; x++) {
+                const srcIdx = y * paddedBytesPerRow + x * 4;
+                const dstIdx = (y * width + x) * 4;
+                result[dstIdx] = rawData[srcIdx] / 255.0; // Normalize to 0-1
+                result[dstIdx+1] = rawData[srcIdx+1] / 255.0;
+                result[dstIdx+2] = rawData[srcIdx+2] / 255.0;
+                result[dstIdx+3] = rawData[srcIdx+3] / 255.0;
+            }
+        }
+        
+        buffer.unmap();
+        return result;
+    }
+
+    const btnTrain = document.getElementById('btnTrain');
+    if(btnTrain) {
+        btnTrain.onclick = async () => {
+            if(labels.size === 0) {
+                alert("Please draw some labels first!");
+                return;
+            }
+            statusSpan.textContent = `Reading GPU data...`;
+            
+            // 1. Read Features (Using SmoothedTexture as features)
+            // Use smoothedTexture if available, else original
+            const sourceTex = smoothedTexture || originalTexture;
+            const pixelData = await readPixelsFromGPU(sourceTex, loadedWidth, loadedHeight); // Normalised 0-1
+            
+            // 2. Extract Labeled Data
+            let c1Sum = [0,0,0,0], c1Count = 0;
+            let c2Sum = [0,0,0,0], c2Count = 0;
+
+            for(let [key, classId] of labels) {
+                const [x, y] = key.split(',').map(Number);
+                const idx = (y * loadedWidth + x) * 4;
+                const r = pixelData[idx];
+                const g = pixelData[idx+1];
+                const b = pixelData[idx+2];
+                const a = pixelData[idx+3];
+                
+                if(classId === 1) {
+                    c1Sum[0]+=r; c1Sum[1]+=g; c1Sum[2]+=b; c1Sum[3]+=a;
+                    c1Count++;
+                } else {
+                    c2Sum[0]+=r; c2Sum[1]+=g; c2Sum[2]+=b; c2Sum[3]+=a;
+                    c2Count++;
+                }
+            }
+
+            if(c1Count === 0 || c2Count === 0) {
+                alert("Please label both classes!");
+                return;
+            }
+
+            // Simple Centroid Training
+            const c1Mean = c1Sum.map(v => v/c1Count);
+            const c2Mean = c2Sum.map(v => v/c2Count);
+            console.log("Centroid 1:", c1Mean);
+            console.log("Centroid 2:", c2Mean);
+
+            statusSpan.textContent = `Training Complete. Predicting...`;
+
+            // 3. Inference (Render Prediction Map)
+            renderPrediction(sourceTex, c1Mean, c2Mean);
+        };
+    }
+
+    function renderPrediction(texture, c1, c2) {
+        if (!gpuState) return;
+        const { device, context, format } = gpuState;
+
+        const paramsBuffer = device.createBuffer({
+            size: 32, // 2 vec4s (32 bytes)
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const paramData = new Float32Array([...c1, ...c2]);
+        device.queue.writeBuffer(paramsBuffer, 0, paramData);
+
+        const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: device.createShaderModule({ code: PREDICTION_SHADER }),
+                entryPoint: 'vs_main',
+            },
+            fragment: {
+                module: device.createShaderModule({ code: PREDICTION_SHADER }),
+                entryPoint: 'fs_main',
+                targets: [{ 
+                    format: format,
+                    blend: { // Alpha blending for overlay
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add'},
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add'}
+                    }
+                }],
+            },
+            primitive: { topology: 'triangle-strip' },
+        });
+
+        const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: sampler },
+                { binding: 1, resource: texture.createView() },
+                { binding: 2, resource: { buffer: paramsBuffer }},
+            ],
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        const textureView = context.getCurrentTexture().createView();
+
+        const renderPass = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+                view: textureView,
+                loadOp: 'load', // Keep the underlying image
+                storeOp: 'store',
+            }],
+        });
+        renderPass.setPipeline(pipeline);
+        renderPass.setBindGroup(0, bindGroup);
+        renderPass.draw(4);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+    }
+
+    fileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file || !gpuState) return;
+        const { device, context, format } = gpuState;
+
+        statusSpan.textContent = `Loading ${file.name}...`;
+
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            const ifds = UTIF.decode(arrayBuffer);
+            if (ifds.length === 0) throw new Error("No existing IFDs found");
+            
+            const firstPage = ifds[0];
+            UTIF.decodeImage(arrayBuffer, firstPage);
+            const rgba = UTIF.toRGBA8(firstPage);
+            loadedWidth = firstPage.width;
+            loadedHeight = firstPage.height;
+
+            statusSpan.textContent = `Loaded ${loadedWidth}x${loadedHeight}. Uploading to GPU...`;
+            
+            canvas.width = loadedWidth;
+            canvas.height = loadedHeight;
+            
+            // Resize Label Canvas
+            labelCanvas.width = loadedWidth;
+            labelCanvas.height = loadedHeight;
+            labelCtx.clearRect(0, 0, loadedWidth, loadedHeight);
+            labels.clear();
+
+            // Create Textures
+            originalTexture = device.createTexture({
+                size: [loadedWidth, loadedHeight],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            });
+
+            smoothedTexture = device.createTexture({
+                size: [loadedWidth, loadedHeight],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING, // STORAGE for write
+            });
+
+             tempTexture = device.createTexture({
+                size: [loadedWidth, loadedHeight],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING, // Ping-pong
+            });
+
+            device.queue.writeTexture(
+                { texture: originalTexture },
+                new Uint8Array(rgba),
+                { bytesPerRow: loadedWidth * 4 },
+                { width: loadedWidth, height: loadedHeight }
+            );
+
+            // Initial render
+            renderTexture(originalTexture);
+            statusSpan.textContent = `Ready. ${loadedWidth}x${loadedHeight}`;
+
+            // Reveal controls
+            document.getElementById('featureControls').style.display = 'flex';
+
+        } catch (err) {
+            console.error(err);
+            statusSpan.textContent = "Error: " + err.message;
+        }
+    });
+
+    document.getElementById('sigmaRange').addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById('sigmaDisplay').innerText = val;
+        runGaussian(val);
+    });
+
+</script>
+
+</body>
+</html>
