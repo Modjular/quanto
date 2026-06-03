@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU ilastik</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #1e1e1e; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #top-bar { padding: 10px 20px; background: #2d2d2d; border-bottom: 1px solid #3d3d3d; display: flex; align-items: center; gap: 20px; }
+        #main-container { flex: 1; display: flex; overflow: hidden; }
+        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+        #viewport { flex: 1; position: relative; background: #000; display: flex; justify-content: center; align-items: center; cursor: crosshair; }
+        
+        .control-group { display: flex; flex-direction: column; gap: 8px; }
+        .control-group label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+        input[type="range"] { width: 100%; }
+        
+        .class-selector { display: flex; flex-direction: column; gap: 4px; }
+        .class-item { display: flex; align-items: center; gap: 10px; padding: 8px; background: #333; border-radius: 4px; cursor: pointer; border: 2px solid transparent; }
+        .class-item.active { border-color: #007acc; background: #3d3d3d; }
+        .color-box { width: 16px; height: 16px; border-radius: 2px; }
+        
+        button { background: #007acc; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #0062cc; }
+        button:disabled { background: #444; cursor: not-allowed; }
+
+        canvas { position: absolute; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+        #status { font-size: 12px; color: #888; }
+    </style>
+</head>
+<body>
+
+<div id="top-bar">
+    <h2 style="margin:0; font-size: 18px; color: #007acc;">ilastik <span style="color:#eee; font-weight: 300;">webgpu</span></h2>
+    <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg" style="font-size: 12px;">
+    <div id="status">No image loaded</div>
+</div>
+
+<div id="main-container">
+    <div id="sidebar">
+        <div class="control-group">
+            <label>Feature Scale (Sigma)</label>
+            <div style="display:flex; gap:10px;">
+                <input type="range" id="sigmaRange" min="0.3" max="10.0" step="0.1" value="1.0">
+                <span id="sigmaVal" style="min-width:30px;">1.0</span>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Brush Size</label>
+            <input type="number" id="brushSize" value="5" min="1" max="50">
+        </div>
+
+        <div class="control-group">
+            <label>Classes</label>
+            <div class="class-selector">
+                <div class="class-item active" data-class="0">
+                    <div class="color-box" style="background: red;"></div>
+                    <span>Class 1</span>
+                </div>
+                <div class="class-item" data-class="1">
+                    <div class="color-box" style="background: green;"></div>
+                    <span>Class 2</span>
+                </div>
+            </div>
+        </div>
+
+        <button id="btnTrain" disabled>Live Update Off</button>
+        <div style="font-size:11px; color:#666; line-height:1.4;">
+            1. Load a TIFF image.<br>
+            2. Paint labels (Red/Green).<br>
+            3. Features & RF run on WebGPU.
+        </div>
+    </div>
+
+    <div id="viewport">
+        <canvas id="gpuCanvas"></canvas>
+        <canvas id="labelCanvas"></canvas>
+    </div>
+</div>
+
+<script src="utif.js"></script>
+<script type="module">
+    import { fastfilters3 as ff } from './ff.js';
+    import { FlatRandomForest } from './rf.js';
+
+    const state = {
+        device: null,
+        adapter: null,
+        context: null,
+        format: null,
+        width: 0,
+        height: 0,
+        originalTexture: null,
+        intensityArray: null,
+        featureBuffer: null,
+        probBuffer: null,
+        labels: [], // {x, y, cls}
+        currentClass: 0,
+        sigma: 1.0,
+        isDrawing: false,
+        liveUpdate: false,
+        rf: new FlatRandomForest({ numTrees: 8, maxDepth: 8 })
+    };
+
+    // --- WGSL Shaders ---
+    const RF_INFERENCE_SHADER = `
+        struct Node {
+            feat_idx: i32,
+            threshold: f32,
+            left: i32,
+            right: i32,
+        };
+
+        @group(0) @binding(0) var<storage, read> features: array<f32>;
+        @group(0) @binding(1) var<storage, read> forest: array<Node>;
+        @group(0) @binding(2) var<uniform> tree_roots: array<vec4<i32>, 2>; 
+        @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+        @compute @workgroup_size(16, 16)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let x = id.x; let y = id.y;
+            let w = u32(\${WIDTH});
+            let h = u32(\${HEIGHT});
+            if (x >= w || y >= h) { return; }
+            
+            let pixel_idx = y * w + x;
+            let feat_offset = pixel_idx * 8u;
+            
+            var votes_c1 = 0.0;
+            var num_trees = 8u; 
+
+            for (var t = 0u; t < num_trees; t++) {
+                var node_idx = tree_roots[t/4u][t%4u];
+                if (node_idx < 0) { continue; }
+
+                for (var depth = 0; depth < 10; depth++) {
+                    let node = forest[u32(node_idx)];
+                    if (node.feat_idx == -1) {
+                        let class_id = -node.right - 1;
+                        if (class_id == 0) { votes_c1 += 1.0; }
+                        break;
+                    }
+                    let val = features[feat_offset + u32(node.feat_idx)];
+                    if (val < node.threshold) {
+                        node_idx = node.left;
+                    } else {
+                        node_idx = node.right;
+                    }
+                }
+            }
+
+            output[pixel_idx] = votes_c1 / f32(num_trees);
+        }
+    `;
+
+    const COMPOSITE_SHADER = `
+        struct VertexOutput {
+            @builtin(position) pos: vec4<f32>,
+            @location(0) uv: vec2<f32>,
+        };
+
+        @vertex
+        fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+            var pos = array<vec2<f32>, 4>(vec2(-1,1), vec2(1,1), vec2(-1,-1), vec2(1,-1));
+            var uv = array<vec2<f32>, 4>(vec2(0,0), vec2(1,0), vec2(0,1), vec2(1,1));
+            var out: VertexOutput;
+            out.pos = vec4(pos[idx], 0, 1);
+            out.uv = uv[idx];
+            return out;
+        }
+
+        @group(0) @binding(0) var s: sampler;
+        @group(0) @binding(1) var t_raw: texture_2d<f32>;
+        @group(0) @binding(2) var<storage, read> p_map: array<f32>;
+
+        @fragment
+        fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+            let raw = textureSample(t_raw, s, uv);
+            let w = u32(\${WIDTH});
+            let h = u32(\${HEIGHT});
+            let x = u32(uv.x * f32(w));
+            let y = u32(uv.y * f32(h));
+            let p = p_map[clamp(y * w + x, 0u, w * h - 1u)];
+            
+            // Default alpha is 0.4. If p < 0.0, we have no prediction yet, so alpha is 0.0.
+            var alpha: f32 = 0.4;
+            if (p < 0.0) { alpha = 0.0; }
+            
+            let overlay = mix(vec4(0.0, 1.0, 0.0, alpha), vec4(1.0, 0.0, 0.0, alpha), clamp(p, 0.0, 1.0));
+            return vec4(mix(raw.rgb, overlay.rgb, alpha), 1.0);
+        }
+    `;
+
+    async function init() {
+        if (!navigator.gpu) { alert("WebGPU not supported"); return; }
+        state.adapter = await navigator.gpu.requestAdapter();
+
+        const requiredLimits = {};
+        if (state.adapter.limits.maxBufferSize) requiredLimits.maxBufferSize = state.adapter.limits.maxBufferSize;
+        if (state.adapter.limits.maxStorageBufferBindingSize) requiredLimits.maxStorageBufferBindingSize = state.adapter.limits.maxStorageBufferBindingSize;
+
+        state.device = await state.adapter.requestDevice({ requiredLimits });
+        
+        const canvas = document.getElementById('gpuCanvas');
+        state.context = canvas.getContext('webgpu');
+        state.format = navigator.gpu.getPreferredCanvasFormat();
+        state.context.configure({ device: state.device, format: state.format });
+
+        setupUI();
+    }
+
+    function setupUI() {
+        document.getElementById('sigmaRange').oninput = (e) => {
+            state.sigma = parseFloat(e.target.value);
+            document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
+            if (state.originalTexture) updateFeatures();
+        };
+
+        document.querySelectorAll('.class-item').forEach(el => {
+            el.onclick = () => {
+                document.querySelectorAll('.class-item').forEach(i => i.classList.remove('active'));
+                el.classList.add('active');
+                state.currentClass = parseInt(el.dataset.class);
+            };
+        });
+
+        document.getElementById('fileInput').onchange = loadFile;
+        
+        const lCanvas = document.getElementById('labelCanvas');
+        lCanvas.onmousedown = (e) => { state.isDrawing = true; paint(e); };
+        window.onmouseup = () => { 
+            state.isDrawing = false; 
+            if (state.labels.length > 0 && state.originalTexture) trainAndPredict();
+        };
+        lCanvas.onmousemove = paint;
+    }
+
+    async function loadFile(e) {
+        console.log('loadFile')
+        const file = e.target.files[0];
+        const buffer = await file.arrayBuffer();
+        let rgba, w, h;
+
+        if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
+            const ifds = UTIF.decode(buffer);
+            UTIF.decodeImage(buffer, ifds[0]);
+            rgba = UTIF.toRGBA8(ifds[0]);
+            w = ifds[0].width; h = ifds[0].height;
+        } else {
+            const img = await createImageBitmap(file);
+            w = img.width; h = img.height;
+            const off = new OffscreenCanvas(w, h);
+            const ctx = off.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            rgba = ctx.getImageData(0,0,w,h).data;
+        }
+
+        state.width = w; state.height = h;
+        document.getElementById('gpuCanvas').width = w;
+        document.getElementById('gpuCanvas').height = h;
+        document.getElementById('labelCanvas').width = w;
+        document.getElementById('labelCanvas').height = h;
+
+        // 1. Calculate raw intensities and find min/max
+        state.intensityArray = new Float32Array(w * h);
+        let min = Infinity;
+        let max = -Infinity;
+        
+        for (let i = 0; i < w * h; i++) {
+            const r = rgba[i * 4] / 255;
+            const g = rgba[i * 4 + 1] / 255;
+            const b = rgba[i * 4 + 2] / 255;
+            const val = 0.299 * r + 0.587 * g + 0.114 * b;
+            
+            state.intensityArray[i] = val;
+            if (val < min) min = val;
+            if (val > max) max = val;
+        }
+
+        // 2. Auto-contrast stretch for both display and features
+        const range = (max - min) > 0 ? (max - min) : 1;
+        for (let i = 0; i < w * h; i++) {
+            // Normalize to 0.0 - 1.0
+            const norm = (state.intensityArray[i] - min) / range;
+            
+            // Re-assign normalized float for better Random Forest training
+            state.intensityArray[i] = norm; 
+            
+            // Stretch the display RGBA so you can actually see it on the canvas
+            const val8 = norm * 255;
+            rgba[i * 4]     = val8; // R
+            rgba[i * 4 + 1] = val8; // G
+            rgba[i * 4 + 2] = val8; // B
+            rgba[i * 4 + 3] = 255;  // A (Force fully opaque just in case)
+        }
+        
+        if (state.originalTexture) state.originalTexture.destroy();
+        state.originalTexture = state.device.createTexture({
+            size: [w, h], format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+        });
+        state.device.queue.writeTexture({texture: state.originalTexture}, rgba, {bytesPerRow: w*4}, [w, h]);
+
+        if (state.probBuffer) state.probBuffer.destroy();
+        state.probBuffer = state.device.createBuffer({
+            size: w * h * 4, // 4 bytes per float32
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+        });
+        
+        // Fill the initial probability buffer with -1.0
+        const initialProbs = new Float32Array(w * h).fill(-1.0);
+        state.device.queue.writeBuffer(state.probBuffer, 0, initialProbs);
+
+        document.getElementById('status').innerText = `Loaded ${w}x${h}`;
+        document.getElementById('btnTrain').disabled = false;
+        
+        updateFeatures();
+    }
+
+    async function updateFeatures() {
+        console.log('updateFeatures')
+        const { device, width, height, sigma, intensityArray } = state;
+        if (!intensityArray) return;
+
+        if (state.featureBuffer) state.featureBuffer.destroy();
+        state.featureBuffer = await ff.extract_features(device, intensityArray, width, height, sigma);
+        renderComposite();
+    }
+
+    function paint(e) {
+        if (!state.isDrawing) return;
+        console.log('paint', e)
+        const canvas = document.getElementById('labelCanvas');
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) * (state.width / rect.width));
+        const y = Math.floor((e.clientY - rect.top) * (state.height / rect.height));
+        const radius = parseInt(document.getElementById('brushSize').value);
+        
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = state.currentClass === 0 ? 'rgba(255,0,0,0.5)' : 'rgba(0,255,0,0.5)';
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI*2); ctx.fill();
+
+        if (x >= 0 && x < state.width && y >= 0 && y < state.height) {
+            state.labels.push({x, y, cls: state.currentClass});
+        }
+    }
+
+    async function trainAndPredict() {
+        console.log('trainAndPredict')
+        if (state.labels.length < 5) return;
+        
+        const { device, width, height, sigma, intensityArray } = state;
+        const fullFeats = await ff.compute_filters(device, intensityArray, width, height, sigma);
+        
+        const X = [], y = [];
+        for(const l of state.labels) {
+            const idx = (l.y * width + l.x) * 8;
+            X.push(...fullFeats.slice(idx, idx + 8));
+            y.push(l.cls);
+        }
+
+        state.rf.train(new Float32Array(X), new Int32Array(y), 8);
+        runGPUInference();
+    }
+
+    async function runGPUInference() {
+        console.log('runGPUInference')
+        const { device, width, height, rf, featureBuffer } = state;
+        
+        const forestBuffer = device.createBuffer({
+            size: rf.forestBuffer.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        device.queue.writeBuffer(forestBuffer, 0, rf.forestBuffer);
+
+        const rootsBuffer = device.createBuffer({
+            size: 32, 
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+        const paddedRoots = new Int32Array(8); paddedRoots.set(rf.treeRoots);
+        device.queue.writeBuffer(rootsBuffer, 0, paddedRoots);
+
+        if (state.probBuffer) state.probBuffer.destroy();
+        const probBuffer = device.createBuffer({
+            size: width * height * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        state.probBuffer = probBuffer; 
+
+        const code = RF_INFERENCE_SHADER
+            .replace(/\${WIDTH}/g, width)
+            .replace(/\${HEIGHT}/g, height);
+
+        const module = device.createShaderModule({ code });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: "main" }
+        });
+
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: featureBuffer } },
+                { binding: 1, resource: { buffer: forestBuffer } },
+                { binding: 2, resource: { buffer: rootsBuffer } },
+                { binding: 3, resource: { buffer: probBuffer } }
+            ]
+        });
+
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+        pass.end();
+        device.queue.submit([enc.finish()]);
+
+        renderComposite();
+    }
+
+    function renderComposite() {
+        console.log('renderComposite')
+        const { device, context, format, width, height, originalTexture, probBuffer } = state;
+        if (!originalTexture || !probBuffer) return;
+
+        const code = COMPOSITE_SHADER
+            .replace(/\${WIDTH}/g, width)
+            .replace(/\${HEIGHT}/g, height);
+
+        const module = device.createShaderModule({ code });
+        const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module, entryPoint: 'vs_main' },
+            fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+            primitive: { topology: 'triangle-strip' }
+        });
+
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: device.createSampler() },
+                { binding: 1, resource: originalTexture.createView() },
+                { binding: 2, resource: { buffer: probBuffer } }
+            ]
+        });
+
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginRenderPass({
+            colorAttachments: [{
+                view: context.getCurrentTexture().createView(),
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                loadOp: 'clear', storeOp: 'store'
+            }]
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(4);
+        pass.end();
+        device.queue.submit([enc.finish()]);
+    }
+
+    init();
+</script>
+</body>
+</html>
