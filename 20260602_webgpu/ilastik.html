@@ -104,6 +104,27 @@
     };
 
     // --- WGSL Shaders ---
+    const GATHER_FEATURES_SHADER = `
+        @group(0) @binding(0) var<storage, read> src_features: array<f32>;
+        @group(0) @binding(1) var<storage, read> indices: array<u32>;
+        @group(0) @binding(2) var<storage, read_write> dst_features: array<f32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let label_idx = id.x;
+            let num_labels = arrayLength(&indices);
+            if (label_idx >= num_labels) { return; }
+
+            let pixel_idx = indices[label_idx];
+            let src_offset = pixel_idx * 8u;
+            let dst_offset = label_idx * 8u;
+
+            for (var i = 0u; i < 8u; i++) {
+                dst_features[dst_offset + i] = src_features[src_offset + i];
+            }
+        }
+    `;
+
     const RF_INFERENCE_SHADER = `
         struct Node {
             feat_idx: i32,
@@ -183,7 +204,6 @@
             let y = u32(uv.y * f32(h));
             let p = p_map[clamp(y * w + x, 0u, w * h - 1u)];
             
-            // Default alpha is 0.4. If p < 0.0, we have no prediction yet, so alpha is 0.0.
             var alpha: f32 = 0.4;
             if (p < 0.0) { alpha = 0.0; }
             
@@ -262,7 +282,6 @@
         document.getElementById('labelCanvas').width = w;
         document.getElementById('labelCanvas').height = h;
 
-        // 1. Calculate raw intensities and find min/max
         state.intensityArray = new Float32Array(w * h);
         let min = Infinity;
         let max = -Infinity;
@@ -278,21 +297,16 @@
             if (val > max) max = val;
         }
 
-        // 2. Auto-contrast stretch for both display and features
         const range = (max - min) > 0 ? (max - min) : 1;
         for (let i = 0; i < w * h; i++) {
-            // Normalize to 0.0 - 1.0
             const norm = (state.intensityArray[i] - min) / range;
-            
-            // Re-assign normalized float for better Random Forest training
             state.intensityArray[i] = norm; 
             
-            // Stretch the display RGBA so you can actually see it on the canvas
             const val8 = norm * 255;
-            rgba[i * 4]     = val8; // R
-            rgba[i * 4 + 1] = val8; // G
-            rgba[i * 4 + 2] = val8; // B
-            rgba[i * 4 + 3] = 255;  // A (Force fully opaque just in case)
+            rgba[i * 4]     = val8;
+            rgba[i * 4 + 1] = val8;
+            rgba[i * 4 + 2] = val8;
+            rgba[i * 4 + 3] = 255;
         }
         
         if (state.originalTexture) state.originalTexture.destroy();
@@ -304,11 +318,10 @@
 
         if (state.probBuffer) state.probBuffer.destroy();
         state.probBuffer = state.device.createBuffer({
-            size: w * h * 4, // 4 bytes per float32
+            size: w * h * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
         });
         
-        // Fill the initial probability buffer with -1.0
         const initialProbs = new Float32Array(w * h).fill(-1.0);
         state.device.queue.writeBuffer(state.probBuffer, 0, initialProbs);
 
@@ -347,20 +360,79 @@
     }
 
     async function trainAndPredict() {
-        console.log('trainAndPredict')
+        console.log('trainAndPredict (Optimized Gather Pass)')
         if (state.labels.length < 5) return;
         
-        const { device, width, height, sigma, intensityArray } = state;
-        const fullFeats = await ff.compute_filters(device, intensityArray, width, height, sigma);
+        const { device, width, height, featureBuffer } = state;
+        const numLabels = state.labels.length;
+
+        // 1. Prepare flat coordinate index arrays and target classes
+        const indicesArray = new Uint32Array(numLabels);
+        const yArray = new Int32Array(numLabels);
         
-        const X = [], y = [];
-        for(const l of state.labels) {
-            const idx = (l.y * width + l.x) * 8;
-            X.push(...fullFeats.slice(idx, idx + 8));
-            y.push(l.cls);
+        for (let i = 0; i < numLabels; i++) {
+            const l = state.labels[i];
+            indicesArray[i] = l.y * width + l.x;
+            yArray[i] = l.cls;
         }
 
-        state.rf.train(new Float32Array(X), new Int32Array(y), 8);
+        // 2. Setup GPU buffers for the mini gather pipeline
+        const indicesBuffer = device.createBuffer({
+            size: indicesArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        device.queue.writeBuffer(indicesBuffer, 0, indicesArray);
+
+        const gatherDstSize = numLabels * 8 * 4; // 8 features * 4 bytes per float32
+        const gatherDstBuffer = device.createBuffer({
+            size: gatherDstSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+
+        const stagingBuffer = device.createBuffer({
+            size: gatherDstSize,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        });
+
+        // 3. Compile and launch the fast gather pass
+        const module = device.createShaderModule({ code: GATHER_FEATURES_SHADER });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+        });
+
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: featureBuffer } },
+                { binding: 1, resource: { buffer: indicesBuffer } },
+                { binding: 2, resource: { buffer: gatherDstBuffer } }
+            ]
+        });
+
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(numLabels / 64));
+        pass.end();
+
+        // 4. Transfer the tiny contiguous vector list to the staging buffer
+        enc.copyBufferToBuffer(gatherDstBuffer, 0, stagingBuffer, 0, gatherDstSize);
+        device.queue.submit([enc.finish()]);
+
+        // 5. Instantly map and extract only the relevant features
+        await stagingBuffer.mapAsync(GPUMapMode.READ);
+        const X = new Float32Array(stagingBuffer.getMappedRange().slice());
+        stagingBuffer.unmap();
+
+        // Cleanup intermediate gathering allocations
+        indicesBuffer.destroy();
+        gatherDstBuffer.destroy();
+        stagingBuffer.destroy();
+
+        // 6. Train using only the filtered metrics and refresh predictions
+        state.rf.train(X, yArray, 8);
         runGPUInference();
     }
 
