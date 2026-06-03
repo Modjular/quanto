@@ -231,10 +231,22 @@
     }
 
     function setupUI() {
+        const btn = document.getElementById('btnTrain');
+        btn.onclick = () => {
+            state.liveUpdate = !state.liveUpdate;
+            btn.innerText = state.liveUpdate ? "Live Update On" : "Live Update Off";
+            btn.style.background = state.liveUpdate ? "#4CAF50" : "#007acc";
+            if (state.liveUpdate && state.labels.length > 0 && state.originalTexture) trainAndPredict();
+        };
+
         document.getElementById('sigmaRange').oninput = (e) => {
             state.sigma = parseFloat(e.target.value);
             document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
-            if (state.originalTexture) updateFeatures();
+            if (state.originalTexture) {
+                updateFeatures().then(() => {
+                    if (state.liveUpdate && state.labels.length > 0) trainAndPredict();
+                });
+            }
         };
 
         document.querySelectorAll('.class-item').forEach(el => {
@@ -251,7 +263,7 @@
         lCanvas.onmousedown = (e) => { state.isDrawing = true; paint(e); };
         window.onmouseup = () => { 
             state.isDrawing = false; 
-            if (state.labels.length > 0 && state.originalTexture) trainAndPredict();
+            if (state.liveUpdate && state.labels.length > 0 && state.originalTexture) trainAndPredict();
         };
         lCanvas.onmousemove = paint;
     }
