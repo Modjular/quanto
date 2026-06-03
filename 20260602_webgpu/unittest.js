@@ -155,6 +155,90 @@ runFiltersTest().catch(e => {
     process.exit(1);
 });
 
+
+async function runTests() {
+  log("Running WebGPU Filter Tests", "HEADER");
+  const gpu = navigator.gpu;
+  const adapter = await gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  
+  const width = 128, height = 128;
+  const mid = (height/2) * width + (width/2);
+  const scale = 1.0;
+
+  // --- Test 1: Flat Field ---
+  log("Test 1: Flat Field (1.0 Everywhere)", "HEADER");
+  const flat = new Float32Array(width * height).fill(1.0);
+  const res1 = await ff.compute_filters(device, flat, width, height, scale);
+  
+  if (res1.length !== 8 * width * height) {
+    log(`Shape mismatch: Expected 8 channels, got ${res1.length / (width * height)}`, "FAIL");
+  } else {
+    const f = {
+      smooth: res1[mid*8],
+      laplacian: res1[mid*8 + 1],
+      gradient: res1[mid*8 + 2],
+      dog: res1[mid*8 + 3],
+      s_max: res1[mid*8 + 4],
+      h_max: res1[mid*8 + 6]
+    };
+    
+    let ok = true;
+    if (Math.abs(f.smooth - 1.0) > 1e-5) { log(`Smoothing failed: ${f.smooth}`, "FAIL"); ok = false; }
+    if (Math.abs(f.laplacian) > 1e-5) { log(`Laplacian failed: ${f.laplacian}`, "FAIL"); ok = false; }
+    if (Math.abs(f.gradient) > 1e-5) { log(`Gradient failed: ${f.gradient}`, "FAIL"); ok = false; }
+    if (Math.abs(f.dog) > 1e-5) { log(`DoG failed: ${f.dog}`, "FAIL"); ok = false; }
+    if (Math.abs(f.s_max) > 1e-5) { log(`Structure Tensor failed: ${f.s_max}`, "FAIL"); ok = false; }
+    if (Math.abs(f.h_max) > 1e-5) { log(`Hessian failed: ${f.h_max}`, "FAIL"); ok = false; }
+    if (ok) log("Flat field invariant PASS", "PASS");
+  }
+
+  // --- Test 2: Step Edge ---
+  log("Test 2: Step Edge (Mathematical Invariants)", "HEADER");
+  const step = new Float32Array(width * height);
+  for(let i=0; i<height*width; i++) step[i] = (i % width) < width/2 ? 0 : 1;
+  const res2 = await ff.compute_filters(device, step, width, height, scale);
+  
+  const edge = mid * 8;
+  const traceH = res2[edge + 6] + res2[edge + 7];
+  const laplacian = res2[edge + 1];
+  const traceS = res2[edge + 4] + res2[edge + 5];
+  const gradMagSq = Math.pow(res2[edge + 2], 2);
+
+  if (Math.abs(traceH - laplacian) < 1e-3) {
+    log("Trace(Hessian) == Laplacian", "PASS");
+  } else {
+    log(`Trace(Hessian) invariant FAIL: ${traceH} vs ${laplacian}`, "FAIL");
+  }
+
+  if (Math.abs(traceS - gradMagSq) < 1e-3) {
+    log("Trace(StructureTensor) == GradMag^2", "PASS");
+  } else {
+    log(`Trace(StructureTensor) invariant FAIL: ${traceS} vs ${gradMagSq}`, "FAIL");
+  }
+
+  // --- Test 3: Impulse Response ---
+  log("Test 3: Impulse Response (Energy)", "HEADER");
+  const impulse = new Float32Array(width * height);
+  impulse[mid] = 1.0;
+  const res3 = await ff.compute_filters(device, impulse, width, height, scale);
+  
+  const k0 = ff.gaussian_kernel(scale, 0);
+  const expectedPeak = k0[0] * k0[0]; // Smoothing is 1D horizontal * 1D vertical
+  const actualPeak = res3[mid * 8];
+  
+  if (Math.abs(actualPeak - expectedPeak) < 1e-4) {
+    log(`Smoothing peak verified: ${actualPeak.toExponential(3)}`, "PASS");
+  } else {
+    log(`Smoothing peak FAIL: Expected ${expectedPeak.toExponential(3)}, got ${actualPeak.toExponential(3)}`, "FAIL");
+  }
+
+  log("All tests completed.", "HEADER");
+}
+
+runTests()
+
+
 /**
  * 
  *  FlatRandomForest Tests
