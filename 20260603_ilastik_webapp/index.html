@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU ilastik</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #1e1e1e; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #top-bar { padding: 10px 20px; background: #2d2d2d; border-bottom: 1px solid #3d3d3d; display: flex; align-items: center; gap: 20px; }
+        #main-container { flex: 1; display: flex; overflow: hidden; }
+        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+        #viewport { flex: 1; position: relative; background: #000; display: flex; justify-content: center; align-items: center; cursor: crosshair; }
+        
+        .control-group { display: flex; flex-direction: column; gap: 8px; }
+        .control-group label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
+        input[type="range"] { width: 100%; }
+        
+        .class-selector { display: flex; flex-direction: column; gap: 4px; }
+        .class-item { display: flex; align-items: center; gap: 10px; padding: 8px; background: #333; border-radius: 4px; cursor: pointer; border: 2px solid transparent; }
+        .class-item.active { border-color: #007acc; background: #3d3d3d; }
+        .color-box { width: 16px; height: 16px; border-radius: 2px; }
+        
+        button { background: #007acc; color: white; border: none; padding: 10px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #0062cc; }
+        button:disabled { background: #444; cursor: not-allowed; }
+
+        canvas { position: absolute; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+        #status { font-size: 12px; color: #888; }
+    </style>
+</head>
+<body>
+
+<div id="top-bar">
+    <h2 style="margin:0; font-size: 18px; color: #007acc;">ilastik <span style="color:#eee; font-weight: 300;">webgpu</span></h2>
+    <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg" style="font-size: 12px;">
+    <div id="status">No image loaded</div>
+</div>
+
+<div id="main-container">
+    <div id="sidebar">
+        <div class="control-group">
+            <label>Feature Scale (Sigma)</label>
+            <div style="display:flex; gap:10px;">
+                <input type="range" id="sigmaRange" min="0.3" max="10.0" step="0.1" value="1.0">
+                <span id="sigmaVal" style="min-width:30px;">1.0</span>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Brush Size</label>
+            <input type="number" id="brushSize" value="5" min="1" max="50">
+        </div>
+
+        <div class="control-group">
+            <label>Classes</label>
+            <div class="class-selector">
+                <div class="class-item active" data-class="0">
+                    <div class="color-box" style="background: red;"></div>
+                    <span>Class 1</span>
+                </div>
+                <div class="class-item" data-class="1">
+                    <div class="color-box" style="background: green;"></div>
+                    <span>Class 2</span>
+                </div>
+            </div>
+        </div>
+
+        <button id="btnTrain" disabled>Live Update Off</button>
+        <div style="font-size:11px; color:#666; line-height:1.4;">
+            1. Load a TIFF image.<br>
+            2. Paint labels (Red/Green).<br>
+            3. Features & RF run on WebGPU.
+        </div>
+    </div>
+
+    <div id="viewport">
+        <canvas id="gpuCanvas"></canvas>
+        <canvas id="labelCanvas"></canvas>
+    </div>
+</div>
+
+<script src="utif.js"></script>
+<script type="module">
+    import { FlatRandomForest } from './rf.js';
+    import { WebGpuBackend } from './webgpu-backend.js';
+
+    const state = {
+        backend: null,
+        width: 0,
+        height: 0,
+        intensityArray: null,
+        labels: [], // {x, y, cls}
+        currentClass: 0,
+        sigma: 1.0,
+        isDrawing: false,
+        liveUpdate: false,
+        rf: new FlatRandomForest({ numTrees: 8, maxDepth: 8 })
+    };
+
+    async function init() {
+        state.backend = new WebGpuBackend();
+        
+        try {
+            const canvas = document.getElementById('gpuCanvas');
+            await state.backend.initialize(canvas);
+        } catch (error) {
+            console.error(error);
+            alert("WebGPU not supported or initialization failed.");
+            // Future placeholder hook for: state.backend = new WebGl2Backend();
+            return;
+        }
+
+        setupUI();
+    }
+
+    function setupUI() {
+        const btn = document.getElementById('btnTrain');
+        btn.onclick = () => {
+            state.liveUpdate = !state.liveUpdate;
+            btn.innerText = state.liveUpdate ? "Live Update On" : "Live Update Off";
+            btn.style.background = state.liveUpdate ? "#4CAF50" : "#007acc";
+            if (state.liveUpdate && state.labels.length > 0 && state.intensityArray) trainAndPredict();
+        };
+
+        document.getElementById('sigmaRange').oninput = async (e) => {
+            state.sigma = parseFloat(e.target.value);
+            document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
+            if (state.intensityArray) {
+                await state.backend.updateFeatures(state.intensityArray, state.sigma);
+                if (state.liveUpdate && state.labels.length > 0) trainAndPredict();
+            }
+        };
+
+        document.querySelectorAll('.class-item').forEach(el => {
+            el.onclick = () => {
+                document.querySelectorAll('.class-item').forEach(i => i.classList.remove('active'));
+                el.classList.add('active');
+                state.currentClass = parseInt(el.dataset.class);
+            };
+        });
+
+        document.getElementById('fileInput').onchange = loadFile;
+        
+        const lCanvas = document.getElementById('labelCanvas');
+        lCanvas.onmousedown = (e) => { state.isDrawing = true; paint(e); };
+        window.onmouseup = () => { 
+            state.isDrawing = false; 
+            if (state.liveUpdate && state.labels.length > 0 && state.intensityArray) trainAndPredict();
+        };
+        lCanvas.onmousemove = paint;
+    }
+
+    async function loadFile(e) {
+        console.log('loadFile');
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const buffer = await file.arrayBuffer();
+        let rgba, w, h;
+
+        if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
+            const ifds = UTIF.decode(buffer);
+            UTIF.decodeImage(buffer, ifds[0]);
+            rgba = UTIF.toRGBA8(ifds[0]);
+            w = ifds[0].width; h = ifds[0].height;
+        } else {
+            const img = await createImageBitmap(file);
+            w = img.width; h = img.height;
+            const off = new OffscreenCanvas(w, h);
+            const ctx = off.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            rgba = ctx.getImageData(0, 0, w, h).data;
+        }
+
+        state.width = w; 
+        state.height = h;
+        
+        document.getElementById('gpuCanvas').width = w;
+        document.getElementById('gpuCanvas').height = h;
+        document.getElementById('labelCanvas').width = w;
+        document.getElementById('labelCanvas').height = h;
+
+        state.intensityArray = new Float32Array(w * h);
+        let min = Infinity;
+        let max = -Infinity;
+        
+        for (let i = 0; i < w * h; i++) {
+            const r = rgba[i * 4] / 255;
+            const g = rgba[i * 4 + 1] / 255;
+            const b = rgba[i * 4 + 2] / 255;
+            const val = 0.299 * r + 0.587 * g + 0.114 * b;
+            
+            state.intensityArray[i] = val;
+            if (val < min) min = val;
+            if (val > max) max = val;
+        }
+
+        const range = (max - min) > 0 ? (max - min) : 1;
+        for (let i = 0; i < w * h; i++) {
+            const norm = (state.intensityArray[i] - min) / range;
+            state.intensityArray[i] = norm; 
+            
+            const val8 = norm * 255;
+            rgba[i * 4]     = val8;
+            rgba[i * 4 + 1] = val8;
+            rgba[i * 4 + 2] = val8;
+            rgba[i * 4 + 3] = 255;
+        }
+        
+        // Pass allocations down into backend state safely
+        await state.backend.allocateImage(w, h, rgba);
+
+        document.getElementById('status').innerText = `Loaded ${w}x${h}`;
+        document.getElementById('btnTrain').disabled = false;
+        
+        await state.backend.updateFeatures(state.intensityArray, state.sigma);
+    }
+
+    function paint(e) {
+        if (!state.isDrawing) return;
+        console.log('paint', e);
+        const canvas = document.getElementById('labelCanvas');
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) * (state.width / rect.width));
+        const y = Math.floor((e.clientY - rect.top) * (state.height / rect.height));
+        const radius = parseInt(document.getElementById('brushSize').value);
+        
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = state.currentClass === 0 ? 'rgba(255,0,0,0.5)' : 'rgba(0,255,0,0.5)';
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI*2); ctx.fill();
+
+        if (x >= 0 && x < state.width && y >= 0 && y < state.height) {
+            state.labels.push({x, y, cls: state.currentClass});
+        }
+    }
+
+    async function trainAndPredict() {
+        console.log('trainAndPredict (Optimized Gather Pass)');
+        if (state.labels.length < 5) return;
+        
+        const numLabels = state.labels.length;
+
+        const indicesArray = new Uint32Array(numLabels);
+        const yArray = new Int32Array(numLabels);
+        
+        for (let i = 0; i < numLabels; i++) {
+            const l = state.labels[i];
+            indicesArray[i] = l.y * state.width + l.x;
+            yArray[i] = l.cls;
+        }
+
+        // Delegate gathering down to backend module
+        const X = await state.backend.gatherFeaturesForTraining(indicesArray);
+
+        // Train CPU model representation using returned data segment
+        state.rf.train(X, yArray, 8);
+        
+        // Push resulting forest matrix into GPU memory for evaluation map
+        await state.backend.runInference(state.rf);
+    }
+
+    init();
+</script>
+</body>
+</html>
