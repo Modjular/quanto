@@ -84,6 +84,7 @@
 <script type="module">
     import { FlatRandomForest } from './rf.js';
     import { WebGpuBackend } from "./backends/webgpu.js";
+    import { loadFileIntoArray } from "./backends/utils.js"
 
     const state = {
         backend: null,
@@ -152,61 +153,19 @@
     }
 
     async function loadFile(e) {
-        console.log('loadFile');
         const file = e.target.files[0];
         if (!file) return;
 
-        const buffer = await file.arrayBuffer();
-        let rgba, w, h;
-
-        if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
-            const ifds = UTIF.decode(buffer);
-            UTIF.decodeImage(buffer, ifds[0]);
-            rgba = UTIF.toRGBA8(ifds[0]);
-            w = ifds[0].width; h = ifds[0].height;
-        } else {
-            const img = await createImageBitmap(file);
-            w = img.width; h = img.height;
-            const off = new OffscreenCanvas(w, h);
-            const ctx = off.getContext('2d');
-            ctx.drawImage(img, 0, 0);
-            rgba = ctx.getImageData(0, 0, w, h).data;
-        }
+        const { intensityArray, rgba, w, h } = await loadFileIntoArray(file)
 
         state.width = w; 
         state.height = h;
+        state.intensityArray = intensityArray
         
         document.getElementById('gpuCanvas').width = w;
         document.getElementById('gpuCanvas').height = h;
         document.getElementById('labelCanvas').width = w;
         document.getElementById('labelCanvas').height = h;
-
-        state.intensityArray = new Float32Array(w * h);
-        let min = Infinity;
-        let max = -Infinity;
-        
-        for (let i = 0; i < w * h; i++) {
-            const r = rgba[i * 4] / 255;
-            const g = rgba[i * 4 + 1] / 255;
-            const b = rgba[i * 4 + 2] / 255;
-            const val = 0.299 * r + 0.587 * g + 0.114 * b;
-            
-            state.intensityArray[i] = val;
-            if (val < min) min = val;
-            if (val > max) max = val;
-        }
-
-        const range = (max - min) > 0 ? (max - min) : 1;
-        for (let i = 0; i < w * h; i++) {
-            const norm = (state.intensityArray[i] - min) / range;
-            state.intensityArray[i] = norm; 
-            
-            const val8 = norm * 255;
-            rgba[i * 4]     = val8;
-            rgba[i * 4 + 1] = val8;
-            rgba[i * 4 + 2] = val8;
-            rgba[i * 4 + 3] = 255;
-        }
         
         // Pass allocations down into backend state safely
         await state.backend.allocateImage(w, h, rgba);
