@@ -82,7 +82,7 @@
 <script src="utif.js"></script>
 <script type="module">
     import { FlatRandomForest } from './rf.js';
-    import { WebGpuBackend } from './webgpu-backend.js';
+    import { WebGpuBackend } from "./backends/webgpu.js";
 
     const state = {
         backend: null,
@@ -106,7 +106,7 @@
         } catch (error) {
             console.error(error);
             alert("WebGPU not supported or initialization failed.");
-            // Future placeholder hook for: state.backend = new WebGl2Backend();
+            // TODO: Future placeholder hook for: state.backend = new WebGl2Backend();
             return;
         }
 
