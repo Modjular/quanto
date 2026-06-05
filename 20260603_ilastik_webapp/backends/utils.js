@@ -1,3 +1,6 @@
+// import UTIF from "../utif.js"
+import { readImage } from "https://cdn.jsdelivr.net/npm/@itk-wasm/image-io@1.6.0/dist/bundle/index-worker-embedded.min.js";
+
 /**
  * Official ilastik feature identifiers in the order they are concatenated
  * in the output buffer for a single scale.
@@ -64,4 +67,57 @@ export function gaussian_kernel(scale, order = 0) {
   // Return the half-kernel to save GPU uniform space
   for (let i = 0; i <= radius; i++) kernel[i] = fullKernel[radius + i];
   return kernel;
+}
+
+export async function loadFileIntoArray(file) {
+  let data, rgba, w, h;
+
+  if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
+    const buffer = await file.arrayBuffer();
+    const { image } = await readImage(file)
+
+    w = image.size[0]
+    h = image.size[1]
+    rgba = new Int8Array(image.data.length * 4)
+    data = image.data
+  } else {
+    const img = await createImageBitmap(file);
+    w = img.width;
+    h = img.height;
+    const off = new OffscreenCanvas(w, h);
+    const ctx = off.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    rgba = ctx.getImageData(0, 0, w, h).data;
+
+    // Convert RGBA to intensity
+    for (let i = 0; i < w * h; i++) {
+        const r = rgba[i * 4] / 255;
+        const g = rgba[i * 4 + 1] / 255;
+        const b = rgba[i * 4 + 2] / 255;
+        data[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+  }
+
+  const intensityArray = new Float32Array(w * h);
+
+  // Calculate min/max for normalization
+  let [min, max] = [Infinity, -Infinity]
+  for (let i = 0; i < w * h; i++) {
+    if (data[i] < min) min = data[i];
+    if (data[i] > max) max = data[i];
+  }
+
+  const range = (max - min) > 0 ? (max - min) : 255;
+  for (let i = 0; i < w * h; i++) {
+    const norm = (data[i] - min) / range;
+    intensityArray[i] = norm;
+
+    const val8 = norm * 255;
+    rgba[i * 4] = val8;
+    rgba[i * 4 + 1] = val8;
+    rgba[i * 4 + 2] = val8;
+    rgba[i * 4 + 3] = 255;
+  }
+
+  return { intensityArray, rgba, w, h }
 }
