@@ -9,9 +9,27 @@
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #1e1e1e; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         #top-bar { padding: 10px 20px; background: #2d2d2d; border-bottom: 1px solid #3d3d3d; display: flex; align-items: center; gap: 20px; }
         #main-container { flex: 1; display: flex; overflow: hidden; }
-        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
-        #viewport { flex: 1; position: relative; background: #000; display: flex; justify-content: center; align-items: center; cursor: crosshair; }
+        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; flex-shrink: 0; }
         
+        /* Updated viewport for side-by-side layout and drag-and-drop */
+        #viewport { 
+            flex: 1; position: relative; background: #000; 
+            display: flex; justify-content: flex-start; align-items: center; 
+            gap: 20px; padding: 20px; overflow-x: auto; overflow-y: hidden;
+            transition: background 0.2s;
+        }
+        #viewport.drag-active {
+            background: #1a3a4a;
+            border: 2px dashed #007acc;
+        }
+
+        .image-container {
+            position: relative;
+            flex-shrink: 0; /* Prevents images from crushing together */
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            background: #111;
+        }
+
         .control-group { display: flex; flex-direction: column; gap: 8px; }
         .control-group label { font-size: 12px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; }
         input[type="range"] { width: 100%; }
@@ -25,7 +43,10 @@
         button:hover { background: #0062cc; }
         button:disabled { background: #444; cursor: not-allowed; }
 
-        canvas { position: absolute; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+        canvas { position: absolute; top: 0; left: 0; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+        .gpu-canvas { z-index: 1; }
+        .label-canvas { z-index: 2; cursor: crosshair; }
+        
         #status { font-size: 12px; color: #888; }
     </style>
 </head>
@@ -33,8 +54,8 @@
 
 <div id="top-bar">
     <h2 style="margin:0; font-size: 18px; color: #007acc;">ilastik <span style="color:#eee; font-weight: 300;">webgpu</span></h2>
-    <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg" style="font-size: 12px;">
-    <div id="status">No image loaded</div>
+    <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg" multiple style="font-size: 12px;">
+    <div id="status">No images loaded. Drag and drop here.</div>
 </div>
 
 <div id="main-container">
@@ -68,69 +89,56 @@
 
         <button id="btnTrain" disabled>Live Update Off</button>
         <div style="font-size:11px; color:#666; line-height:1.4;">
-            1. Load a TIFF image.<br>
+            1. Drag & drop images.<br>
             2. Paint labels (Red/Green).<br>
             3. Features & RF run on WebGPU.
         </div>
     </div>
 
     <div id="viewport">
-        <canvas id="gpuCanvas"></canvas>
-        <canvas id="labelCanvas"></canvas>
-    </div>
+        </div>
 </div>
 
 <script src="utif.js"></script>
 <script type="module">
     import { FlatRandomForest } from './rf.js';
     import { WebGpuBackend } from "./backends/webgpu.js";
-    import { loadFileIntoArray } from "./backends/utils.js"
+    import { loadFileIntoArray } from "./backends/utils.js";
 
+    // Refactored State to handle collections of images
     const state = {
-        backend: null,
-        width: 0,
-        height: 0,
-        intensityArray: null,
-        labels: [], // {x, y, cls}
+        images: [], // Shape: { id, backend, width, height, intensityArray, labels, container, gpuCanvas, labelCanvas }
         currentClass: 0,
         sigma: 1.0,
         isDrawing: false,
+        activeImageId: null, // Tracks which canvas the user is currently painting on
         liveUpdate: false,
         rf: new FlatRandomForest({ numTrees: 8, maxDepth: 8 })
     };
 
-    async function init() {
-        state.backend = new WebGpuBackend();
-        
-        try {
-            const canvas = document.getElementById('gpuCanvas');
-            await state.backend.initialize(canvas);
-        } catch (error) {
-            console.error(error);
-            alert("WebGPU not supported or initialization failed.");
-            // TODO: Future placeholder hook for: state.backend = new WebGl2Backend();
-            return;
-        }
-
+    function init() {
         setupUI();
     }
 
     function setupUI() {
+        // --- Buttons & Controls ---
         const btn = document.getElementById('btnTrain');
         btn.onclick = () => {
             state.liveUpdate = !state.liveUpdate;
             btn.innerText = state.liveUpdate ? "Live Update On" : "Live Update Off";
             btn.style.background = state.liveUpdate ? "#4CAF50" : "#007acc";
-            if (state.liveUpdate && state.labels.length > 0 && state.intensityArray) trainAndPredict();
+            if (state.liveUpdate) trainAndPredictAll();
         };
 
         document.getElementById('sigmaRange').oninput = async (e) => {
             state.sigma = parseFloat(e.target.value);
             document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
-            if (state.intensityArray) {
-                await state.backend.updateFeatures(state.intensityArray, state.sigma);
-                if (state.liveUpdate && state.labels.length > 0) trainAndPredict();
+            
+            // Recompute features for all loaded images
+            for (const img of state.images) {
+                await img.backend.updateFeatures(img.intensityArray, state.sigma);
             }
+            if (state.liveUpdate) trainAndPredictAll();
         };
 
         document.querySelectorAll('.class-item').forEach(el => {
@@ -141,84 +149,175 @@
             };
         });
 
-        document.getElementById('fileInput').onchange = loadFile;
-        
-        const lCanvas = document.getElementById('labelCanvas');
-        lCanvas.onmousedown = (e) => { state.isDrawing = true; paint(e); };
+        // --- File Intake ---
+        document.getElementById('fileInput').onchange = (e) => handleFiles(e.target.files);
+
+        // --- Drag and Drop Handlers ---
+        const viewport = document.getElementById('viewport');
+        viewport.ondragover = (e) => {
+            e.preventDefault();
+            viewport.classList.add('drag-active');
+        };
+        viewport.ondragleave = (e) => {
+            e.preventDefault();
+            viewport.classList.remove('drag-active');
+        };
+        viewport.ondrop = (e) => {
+            e.preventDefault();
+            viewport.classList.remove('drag-active');
+            handleFiles(e.dataTransfer.files);
+        };
+
+        // --- Global Mouse Up (End Painting) ---
         window.onmouseup = () => { 
             state.isDrawing = false; 
-            if (state.liveUpdate && state.labels.length > 0 && state.intensityArray) trainAndPredict();
+            state.activeImageId = null;
+            if (state.liveUpdate) trainAndPredictAll();
         };
-        lCanvas.onmousemove = paint;
     }
 
-    async function loadFile(e) {
-        const file = e.target.files[0];
-        if (!file) return;
+    async function handleFiles(files) {
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            // Basic check, adjust if you support other formats
+            if (!file.name.match(/\.(tif|tiff|png|jpg|jpeg)$/i)) continue;
+            await addImage(file);
+        }
+    }
 
-        const { intensityArray, rgba, w, h } = await loadFileIntoArray(file)
-
-        state.width = w; 
-        state.height = h;
-        state.intensityArray = intensityArray
+    async function addImage(file) {
+        const { intensityArray, rgba, w, h } = await loadFileIntoArray(file);
         
-        document.getElementById('gpuCanvas').width = w;
-        document.getElementById('gpuCanvas').height = h;
-        document.getElementById('labelCanvas').width = w;
-        document.getElementById('labelCanvas').height = h;
-        
-        // Pass allocations down into backend state safely
-        await state.backend.allocateImage(w, h, rgba);
+        const imgId = Date.now() + Math.random();
 
-        document.getElementById('status').innerText = `Loaded ${w}x${h}`;
+        // 1. Create DOM Elements
+        const container = document.createElement('div');
+        container.className = 'image-container';
+        container.style.width = w + 'px';
+        container.style.height = h + 'px';
+
+        const gpuCanvas = document.createElement('canvas');
+        gpuCanvas.className = 'gpu-canvas';
+        gpuCanvas.width = w; gpuCanvas.height = h;
+
+        const labelCanvas = document.createElement('canvas');
+        labelCanvas.className = 'label-canvas';
+        labelCanvas.width = w; labelCanvas.height = h;
+
+        container.appendChild(gpuCanvas);
+        container.appendChild(labelCanvas);
+        document.getElementById('viewport').appendChild(container);
+
+        // 2. Setup Backend Pipeline
+        const backend = new WebGpuBackend();
+        try {
+            await backend.initialize(gpuCanvas);
+        } catch (error) {
+            console.error(error);
+            alert("WebGPU not supported or initialization failed on one of the images.");
+            container.remove();
+            return;
+        }
+
+        await backend.allocateImage(w, h, rgba);
+        await backend.updateFeatures(intensityArray, state.sigma);
+
+        // 3. Register Image in State
+        const imgState = {
+            id: imgId,
+            backend: backend,
+            width: w, height: h,
+            intensityArray: intensityArray,
+            labels: [],
+            gpuCanvas: gpuCanvas,
+            labelCanvas: labelCanvas,
+            container: container
+        };
+        state.images.push(imgState);
+
+        // 4. Attach Painting Events to this specific image's overlay
+        labelCanvas.onmousedown = (e) => { 
+            state.isDrawing = true; 
+            state.activeImageId = imgId;
+            paint(e, imgState); 
+        };
+        labelCanvas.onmousemove = (e) => {
+            if (state.isDrawing && state.activeImageId === imgId) {
+                paint(e, imgState);
+            }
+        };
+
+        document.getElementById('status').innerText = `Loaded ${state.images.length} image(s)`;
         document.getElementById('btnTrain').disabled = false;
-        
-        await state.backend.updateFeatures(state.intensityArray, state.sigma);
     }
 
-    function paint(e) {
-        if (!state.isDrawing) return;
-        console.log('paint', e);
-        const canvas = document.getElementById('labelCanvas');
-        const rect = canvas.getBoundingClientRect();
-        const x = Math.floor((e.clientX - rect.left) * (state.width / rect.width));
-        const y = Math.floor((e.clientY - rect.top) * (state.height / rect.height));
+    function paint(e, imgState) {
+        const rect = imgState.labelCanvas.getBoundingClientRect();
+        
+        // Scale mouse coords to canvas resolution
+        const x = Math.floor((e.clientX - rect.left) * (imgState.width / rect.width));
+        const y = Math.floor((e.clientY - rect.top) * (imgState.height / rect.height));
         const radius = parseInt(document.getElementById('brushSize').value);
         
-        const ctx = canvas.getContext('2d');
+        const ctx = imgState.labelCanvas.getContext('2d');
         ctx.fillStyle = state.currentClass === 0 ? 'rgba(255,0,0,0.5)' : 'rgba(0,255,0,0.5)';
-        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); 
+        ctx.arc(x, y, radius, 0, Math.PI*2); 
+        ctx.fill();
 
-        if (x >= 0 && x < state.width && y >= 0 && y < state.height) {
-            state.labels.push({x, y, cls: state.currentClass});
+        // Register label into this specific image's local dataset
+        if (x >= 0 && x < imgState.width && y >= 0 && y < imgState.height) {
+            imgState.labels.push({x, y, cls: state.currentClass});
         }
     }
 
-    async function trainAndPredict() {
-        console.log('trainAndPredict (Optimized Gather Pass)');
-        if (state.labels.length < 5) return;
-        
-        const numLabels = state.labels.length;
+    async function trainAndPredictAll() {
+        // Count total global labels
+        let totalLabels = 0;
+        state.images.forEach(img => totalLabels += img.labels.length);
+        if (totalLabels < 5) return;
 
-        const indicesArray = new Uint32Array(numLabels);
-        const yArray = new Int32Array(numLabels);
-        
-        for (let i = 0; i < numLabels; i++) {
-            const l = state.labels[i];
-            indicesArray[i] = l.y * state.width + l.x;
-            yArray[i] = l.cls;
+        // 1. Gather labels across ALL images
+        const allX = [];
+        const yArray = new Int32Array(totalLabels);
+        let currentLabelOffset = 0;
+
+        for (const img of state.images) {
+            const numLabels = img.labels.length;
+            if (numLabels === 0) continue;
+
+            const indicesArray = new Uint32Array(numLabels);
+            for (let i = 0; i < numLabels; i++) {
+                const l = img.labels[i];
+                indicesArray[i] = l.y * img.width + l.x;
+                yArray[currentLabelOffset + i] = l.cls;
+            }
+
+            // Extract the feature slice from this specific image's backend
+            const X_img = await img.backend.gatherFeaturesForTraining(indicesArray);
+            allX.push(X_img);
+            currentLabelOffset += numLabels;
         }
 
-        // Delegate gathering down to backend module
-        const X = await state.backend.gatherFeaturesForTraining(indicesArray);
+        // 2. Flatten feature chunks into one single array to feed the CPU Random Forest
+        const totalFeatureLength = allX.reduce((sum, arr) => sum + arr.length, 0);
+        const combinedX = new Float32Array(totalFeatureLength); // Assuming float32 features
+        let xOffset = 0;
+        for (const arr of allX) {
+            combinedX.set(arr, xOffset);
+            xOffset += arr.length;
+        }
 
-        // Train CPU model representation using returned data segment
-        state.rf.train(X, yArray, 8);
+        // 3. Train the global Random Forest Model
+        state.rf.train(combinedX, yArray, 8);
         
-        // Push resulting forest matrix into GPU memory for evaluation map
-        await state.backend.runInference(state.rf);
+        // 4. Run inference map evaluation on ALL backends using the trained RF
+        for (const img of state.images) {
+            await img.backend.runInference(state.rf);
+        }
     }
 
+    // Bootstrap
     init();
 </script>
 </body>
