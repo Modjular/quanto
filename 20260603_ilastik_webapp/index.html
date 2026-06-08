@@ -3,29 +3,32 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU ilastik</title>
+    <title>Web Ilastik</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎨</text></svg>">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #1e1e1e; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-        #top-bar { padding: 10px 20px; background: #2d2d2d; border-bottom: 1px solid #3d3d3d; display: flex; align-items: center; gap: 20px; }
+        #top-bar { padding: 10px 20px; background: #2d2d2d; border-bottom: 1px solid #3d3d3d; display: flex; align-items: center; gap: 20px; z-index: 10; }
         #main-container { flex: 1; display: flex; overflow: hidden; }
-        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; flex-shrink: 0; }
+        #sidebar { width: 260px; background: #252526; border-right: 1px solid #3d3d3d; padding: 20px; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; flex-shrink: 0; z-index: 10; }
         
-        /* Updated viewport for side-by-side layout and drag-and-drop */
+        /* Viewport hides overflow and acts as the window for our camera */
         #viewport { 
             flex: 1; position: relative; background: #000; 
-            display: flex; justify-content: flex-start; align-items: center; 
-            gap: 20px; padding: 20px; overflow-x: auto; overflow-y: hidden;
+            overflow: hidden; 
             transition: background 0.2s;
         }
-        #viewport.drag-active {
-            background: #1a3a4a;
-            border: 2px dashed #007acc;
+        #viewport.drag-active { background: #1a3a4a; }
+        
+        /* The board moves and scales based on our JS camera state */
+        #canvas-board {
+            display: flex; gap: 20px; padding: 20px;
+            transform-origin: 0 0;
+            width: max-content;
         }
 
         .image-container {
             position: relative;
-            flex-shrink: 0; /* Prevents images from crushing together */
+            flex-shrink: 0;
             box-shadow: 0 4px 15px rgba(0,0,0,0.5);
             background: #111;
         }
@@ -48,6 +51,10 @@
         .label-canvas { z-index: 2; cursor: crosshair; }
         
         #status { font-size: 12px; color: #888; }
+        
+        /* Spacebar panning cursors */
+        body.space-down .label-canvas { cursor: grab !important; }
+        body.space-down.panning .label-canvas { cursor: grabbing !important; }
     </style>
 </head>
 <body>
@@ -91,12 +98,14 @@
         <div style="font-size:11px; color:#666; line-height:1.4;">
             1. Drag & drop images.<br>
             2. Paint labels (Red/Green).<br>
-            3. Features & RF run on WebGPU.
+            3. Trackpad to pan/zoom (or hold Spacebar).<br>
+            4. Run on WebGPU.
         </div>
     </div>
 
     <div id="viewport">
-        </div>
+        <div id="canvas-board"></div>
+    </div>
 </div>
 
 <script src="utif.js"></script>
@@ -105,23 +114,96 @@
     import { WebGpuBackend } from "./backends/webgpu.js";
     import { loadFileIntoArray } from "./backends/utils.js";
 
-    // Refactored State to handle collections of images
     const state = {
-        images: [], // Shape: { id, backend, width, height, intensityArray, labels, container, gpuCanvas, labelCanvas }
+        images: [],
         currentClass: 0,
         sigma: 1.0,
         isDrawing: false,
-        activeImageId: null, // Tracks which canvas the user is currently painting on
+        activeImageId: null,
         liveUpdate: false,
-        rf: new FlatRandomForest({ numTrees: 8, maxDepth: 8 })
+        rf: new FlatRandomForest({ numTrees: 8, maxDepth: 8 }),
+        
+        // Camera & Panning State
+        camera: { x: 0, y: 0, scale: 1 },
+        isSpaceDown: false,
+        isPanning: false
     };
 
     function init() {
         setupUI();
+        setupCamera();
+    }
+
+    function setupCamera() {
+        const viewport = document.getElementById('viewport');
+        const board = document.getElementById('canvas-board');
+
+        function updateBoard() {
+            board.style.transform = `translate(${state.camera.x}px, ${state.camera.y}px) scale(${state.camera.scale})`;
+        }
+
+        // --- Trackpad / Wheel Navigation ---
+        viewport.addEventListener('wheel', (e) => {
+            e.preventDefault(); // Stop browser back-swipe or standard scroll
+            
+            if (e.ctrlKey || e.metaKey) {
+                // Pinch-to-zoom logic
+                const zoomSensitivity = 0.01;
+                const delta = -e.deltaY * zoomSensitivity;
+                const newScale = Math.min(Math.max(0.1, state.camera.scale * Math.exp(delta)), 10);
+                
+                // Calculate cursor position relative to the unscaled board
+                const rect = viewport.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                const boardX = (mouseX - state.camera.x) / state.camera.scale;
+                const boardY = (mouseY - state.camera.y) / state.camera.scale;
+                
+                // Apply new scale and shift X/Y to zoom towards the cursor
+                state.camera.scale = newScale;
+                state.camera.x = mouseX - boardX * state.camera.scale;
+                state.camera.y = mouseY - boardY * state.camera.scale;
+            } else {
+                // Two-finger pan logic
+                state.camera.x -= e.deltaX;
+                state.camera.y -= e.deltaY;
+            }
+            updateBoard();
+        }, { passive: false });
+
+        // --- Spacebar Panning Logic ---
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && !state.isSpaceDown) {
+                state.isSpaceDown = true;
+                document.body.classList.add('space-down');
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space') {
+                state.isSpaceDown = false;
+                state.isPanning = false;
+                document.body.classList.remove('space-down', 'panning');
+            }
+        });
+
+        viewport.addEventListener('mousedown', (e) => {
+            if (state.isSpaceDown) {
+                state.isPanning = true;
+                document.body.classList.add('panning');
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (state.isPanning) {
+                state.camera.x += e.movementX;
+                state.camera.y += e.movementY;
+                updateBoard();
+            }
+        });
     }
 
     function setupUI() {
-        // --- Buttons & Controls ---
         const btn = document.getElementById('btnTrain');
         btn.onclick = () => {
             state.liveUpdate = !state.liveUpdate;
@@ -133,8 +215,6 @@
         document.getElementById('sigmaRange').oninput = async (e) => {
             state.sigma = parseFloat(e.target.value);
             document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
-            
-            // Recompute features for all loaded images
             for (const img of state.images) {
                 await img.backend.updateFeatures(img.intensityArray, state.sigma);
             }
@@ -149,37 +229,29 @@
             };
         });
 
-        // --- File Intake ---
         document.getElementById('fileInput').onchange = (e) => handleFiles(e.target.files);
 
-        // --- Drag and Drop Handlers ---
         const viewport = document.getElementById('viewport');
-        viewport.ondragover = (e) => {
-            e.preventDefault();
-            viewport.classList.add('drag-active');
-        };
-        viewport.ondragleave = (e) => {
-            e.preventDefault();
-            viewport.classList.remove('drag-active');
-        };
+        viewport.ondragover = (e) => { e.preventDefault(); viewport.classList.add('drag-active'); };
+        viewport.ondragleave = (e) => { e.preventDefault(); viewport.classList.remove('drag-active'); };
         viewport.ondrop = (e) => {
             e.preventDefault();
             viewport.classList.remove('drag-active');
             handleFiles(e.dataTransfer.files);
         };
 
-        // --- Global Mouse Up (End Painting) ---
-        window.onmouseup = () => { 
+        window.addEventListener('mouseup', () => { 
             state.isDrawing = false; 
             state.activeImageId = null;
+            state.isPanning = false;
+            document.body.classList.remove('panning');
             if (state.liveUpdate) trainAndPredictAll();
-        };
+        });
     }
 
     async function handleFiles(files) {
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            // Basic check, adjust if you support other formats
             if (!file.name.match(/\.(tif|tiff|png|jpg|jpeg)$/i)) continue;
             await addImage(file);
         }
@@ -187,10 +259,8 @@
 
     async function addImage(file) {
         const { intensityArray, rgba, w, h } = await loadFileIntoArray(file);
-        
         const imgId = Date.now() + Math.random();
 
-        // 1. Create DOM Elements
         const container = document.createElement('div');
         container.className = 'image-container';
         container.style.width = w + 'px';
@@ -206,15 +276,15 @@
 
         container.appendChild(gpuCanvas);
         container.appendChild(labelCanvas);
-        document.getElementById('viewport').appendChild(container);
+        // Append to our new inner board instead of the viewport directly
+        document.getElementById('canvas-board').appendChild(container);
 
-        // 2. Setup Backend Pipeline
         const backend = new WebGpuBackend();
         try {
             await backend.initialize(gpuCanvas);
         } catch (error) {
             console.error(error);
-            alert("WebGPU not supported or initialization failed on one of the images.");
+            alert("WebGPU not supported or initialization failed.");
             container.remove();
             return;
         }
@@ -222,27 +292,20 @@
         await backend.allocateImage(w, h, rgba);
         await backend.updateFeatures(intensityArray, state.sigma);
 
-        // 3. Register Image in State
         const imgState = {
-            id: imgId,
-            backend: backend,
-            width: w, height: h,
-            intensityArray: intensityArray,
-            labels: [],
-            gpuCanvas: gpuCanvas,
-            labelCanvas: labelCanvas,
-            container: container
+            id: imgId, backend, width: w, height: h,
+            intensityArray, labels: [], gpuCanvas, labelCanvas, container
         };
         state.images.push(imgState);
 
-        // 4. Attach Painting Events to this specific image's overlay
         labelCanvas.onmousedown = (e) => { 
+            if (state.isSpaceDown) return; // Block painting if panning
             state.isDrawing = true; 
             state.activeImageId = imgId;
             paint(e, imgState); 
         };
         labelCanvas.onmousemove = (e) => {
-            if (state.isDrawing && state.activeImageId === imgId) {
+            if (state.isDrawing && state.activeImageId === imgId && !state.isSpaceDown) {
                 paint(e, imgState);
             }
         };
@@ -252,9 +315,9 @@
     }
 
     function paint(e, imgState) {
+        // getBoundingClientRect handles CSS scale automatically, 
+        // so no complex coordinate math is required here!
         const rect = imgState.labelCanvas.getBoundingClientRect();
-        
-        // Scale mouse coords to canvas resolution
         const x = Math.floor((e.clientX - rect.left) * (imgState.width / rect.width));
         const y = Math.floor((e.clientY - rect.top) * (imgState.height / rect.height));
         const radius = parseInt(document.getElementById('brushSize').value);
@@ -265,19 +328,16 @@
         ctx.arc(x, y, radius, 0, Math.PI*2); 
         ctx.fill();
 
-        // Register label into this specific image's local dataset
         if (x >= 0 && x < imgState.width && y >= 0 && y < imgState.height) {
             imgState.labels.push({x, y, cls: state.currentClass});
         }
     }
 
     async function trainAndPredictAll() {
-        // Count total global labels
         let totalLabels = 0;
         state.images.forEach(img => totalLabels += img.labels.length);
         if (totalLabels < 5) return;
 
-        // 1. Gather labels across ALL images
         const allX = [];
         const yArray = new Int32Array(totalLabels);
         let currentLabelOffset = 0;
@@ -293,31 +353,26 @@
                 yArray[currentLabelOffset + i] = l.cls;
             }
 
-            // Extract the feature slice from this specific image's backend
             const X_img = await img.backend.gatherFeaturesForTraining(indicesArray);
             allX.push(X_img);
             currentLabelOffset += numLabels;
         }
 
-        // 2. Flatten feature chunks into one single array to feed the CPU Random Forest
         const totalFeatureLength = allX.reduce((sum, arr) => sum + arr.length, 0);
-        const combinedX = new Float32Array(totalFeatureLength); // Assuming float32 features
+        const combinedX = new Float32Array(totalFeatureLength);
         let xOffset = 0;
         for (const arr of allX) {
             combinedX.set(arr, xOffset);
             xOffset += arr.length;
         }
 
-        // 3. Train the global Random Forest Model
         state.rf.train(combinedX, yArray, 8);
         
-        // 4. Run inference map evaluation on ALL backends using the trained RF
         for (const img of state.images) {
             await img.backend.runInference(state.rf);
         }
     }
 
-    // Bootstrap
     init();
 </script>
 </body>
