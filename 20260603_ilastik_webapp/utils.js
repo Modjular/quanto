@@ -239,3 +239,97 @@ export async function exportImagesData(images, rf, options) {
         URL.revokeObjectURL(link.href);
     }
 }
+
+// ---------------------------------------------------------------------------
+// inferAxes(shape)
+//
+// Given a multi-dimensional image shape array (e.g. [10, 512, 768] for a
+// Z-stack), return the two axis indices that should be used as the display
+// XY plane.
+//
+// Strategy: prefer the last two dimensions (NumPy / TIFF channel-first
+// convention: [Z, Y, X] or [C, Y, X]), which is almost always correct.
+// The "two largest" heuristic would mis-select a large Z-stack as X/Y, so
+// we intentionally avoid it.
+//
+// For 2-D images (shape.length === 2) this returns [0, 1] and callers should
+// hide the axis selector entirely — no-op selection.
+//
+// Returns: { axisY: number, axisX: number }
+// ---------------------------------------------------------------------------
+export function inferAxes(shape) {
+    if (!Array.isArray(shape) || shape.length < 2) {
+        throw new Error(`inferAxes: shape must have at least 2 dimensions, got ${JSON.stringify(shape)}`);
+    }
+    const n = shape.length;
+    return { axisY: n - 2, axisX: n - 1 };
+}
+
+// ---------------------------------------------------------------------------
+// pickSlice(ndarray, shape, axes, sliceIndices)
+//
+// Extract a 2-D slice from a flat typed array representing an n-D image.
+//
+// Parameters:
+//   ndarray      – flat Float32Array (or similar) of the full image data
+//   shape        – Array<number>  e.g. [10, 512, 768]
+//   axes         – { axisY, axisX }  which dims to treat as Y and X
+//   sliceIndices – Array<number>  index to use for each non-display axis
+//                  (length must equal shape.length - 2, in dimension order
+//                  excluding axisY and axisX)
+//
+// Returns a Float32Array of length shape[axisY] * shape[axisX].
+//
+// This is intentionally simple: it iterates in JS rather than using GPU
+// tricks. For large stacks the caller should call this once at slice-select
+// time and cache the result, not on every frame.
+// ---------------------------------------------------------------------------
+export function pickSlice(ndarray, shape, { axisY, axisX }, sliceIndices) {
+    const height = shape[axisY];
+    const width  = shape[axisX];
+    const result = new Float32Array(height * width);
+
+    // Build stride table (row-major / C order)
+    const strides = new Array(shape.length);
+    strides[shape.length - 1] = 1;
+    for (let i = shape.length - 2; i >= 0; i--) {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+
+    // Map non-display axes → their fixed slice index
+    const fixedAxes = [];
+    let sliceIdx = 0;
+    for (let dim = 0; dim < shape.length; dim++) {
+        if (dim !== axisY && dim !== axisX) {
+            fixedAxes.push({ dim, idx: sliceIndices[sliceIdx++] });
+        }
+    }
+
+    // Compute base offset from fixed axes
+    let baseOffset = 0;
+    for (const { dim, idx } of fixedAxes) {
+        baseOffset += idx * strides[dim];
+    }
+
+    // Fill result
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const srcIdx = baseOffset + y * strides[axisY] + x * strides[axisX];
+            result[y * width + x] = ndarray[srcIdx];
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// isDuplicateFile(file, existingImages)
+//
+// Returns true if a file with the same name and byte-size is already in the
+// loaded image list. Used to silently deduplicate drag-and-drop re-drops.
+// ---------------------------------------------------------------------------
+export function isDuplicateFile(file, existingImages) {
+    return existingImages.some(
+        img => img.name === file.name && img.fileSize === file.size
+    );
+}
