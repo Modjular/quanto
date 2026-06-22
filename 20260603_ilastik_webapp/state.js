@@ -35,7 +35,4 @@ export const state = {
     camera: { x: 0, y: 0, scale: 1 },
     isSpaceDown: false,
     isPanning: false,
-
-    // Export
-    outputDirHandle: null,
 };

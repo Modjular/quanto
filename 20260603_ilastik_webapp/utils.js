@@ -68,38 +68,6 @@ export function intensityToRGBA(data, rgba, intensityArray) {
     }
 }
 
-/**
- * Verifies or requests permission to access a file or directory handle.
- * @param {FileSystemHandle} fileHandle - The file or directory handle to verify.
- * @param {boolean} readWrite - Whether to request read-write permission (true) or just read permission (false).
- * @returns {Promise<boolean>} True if permission was granted, false otherwise.
- */
-export async function verifyPermission(fileHandle, readWrite) {
-  const options = {};
-  if (readWrite) {
-    options.mode = 'readwrite';
-  }
-  if ((await fileHandle.queryPermission(options)) === 'granted') {
-    return true;
-  }
-  if ((await fileHandle.requestPermission(options)) === 'granted') {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Handles writing a file to disk using the File System API
- * @param {FileSystemDirectoryHandle} folderHandle 
- * @param {String} filename 
- * @param {Blob} blob 
- */
-export async function writeFile(folderHandle, filename, blob) {
-  const fileHandle = await folderHandle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(blob);
-  await writable.close();
-}
 
 /**
  * Aggregates features and labels across all images into 1D typed arrays for Random Forest training.
@@ -141,9 +109,8 @@ export async function buildTrainingDataset(images, totalLabels) {
 }
 
 /**
- * Handles generating ITK images, requesting file permissions, and batching files into ZIPs or directories.
+ * Handles generating ITK images and batching files into ZIPs.
  * @param {Array<Object>} images - Array of image objects to export.
- * @param {FileSystemDirectoryHandle} outputDirHandle - Optional handle to the output directory. If omitted, exports to a ZIP.
  * @param {boolean} exportSeg - Whether to export segmentation masks.
  * @param {boolean} exportProb - Whether to export probability maps.
  * @param {Function} progressCallback - Optional callback for UI progress updates.
@@ -151,14 +118,8 @@ export async function buildTrainingDataset(images, totalLabels) {
  */
 export async function exportImagesData(images, outputDirHandle, exportProb, exportSeg, progressCallback) {
     // Array to temporarily hold file data if we are zipping
-    const filesToZip = []; 
-
-    if (outputDirHandle) {
-        const permission = await verifyPermission(outputDirHandle, true);
-        if (!permission) {
-            throw new Error("Permission to write to output directory was denied.");
-        }
-    }
+    const filesToZip = [];
+    const callback = progressCallback || ((m) => console.log(m))
 
     for (let i = 0; i < images.length; i++) {
         const img = images[i];
@@ -202,13 +163,8 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
             const filename = `${baseName}_segmentation.tif`;
             const { serializedImage } = await writeImage(itkImage, `${itkImage.name}.tif`);
             
-            if (outputDirHandle) {
-                const blob = new Blob([serializedImage.data], { type: 'image/tiff' });
-                await writeFile(outputDirHandle, filename, blob);
-            } else {
-                // Store the raw ArrayBuffer for the worker
-                filesToZip.push({ name: filename, data: serializedImage.data.buffer });
-            }
+            // Store the raw ArrayBuffer for the worker
+            filesToZip.push({ name: filename, data: serializedImage.data.buffer });
         }
 
         if (exportProb) {
@@ -233,17 +189,12 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
             const filename = `${baseName}_probabilities.tif`;
             const { serializedImage } = await writeImage(itkImage, `${itkImage.name}.tif`);
             
-            if (outputDirHandle) {
-                const blob = new Blob([serializedImage.data], { type: 'image/tiff' });
-                await writeFile(outputDirHandle, filename, blob);
-            } else {
-                // Store the raw ArrayBuffer for the worker
-                filesToZip.push({ name: filename, data: serializedImage.data.buffer });
-            }
+            // Store the raw ArrayBuffer for the worker
+            filesToZip.push({ name: filename, data: serializedImage.data.buffer });
         }
     }
 
-    if (!outputDirHandle && filesToZip.length > 0) {
+    if (filesToZip.length > 0) {
         /**
          * To prevent the main thread from locking during the zip we do it in a webworker.
          * This allows a progress callback to update regularly.
@@ -279,7 +230,7 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
                 const { type, metadata, content, error } = e.data;
 
                 if (type === 'progress') {
-                    progressCallback(metadata.percent, metadata.currentFile);
+                    callback(metadata.percent, metadata.currentFile);
                 } 
                 else if (type === 'done') {
                     const link = document.createElement('a');
@@ -291,7 +242,7 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
                     
                     worker.terminate();
                     URL.revokeObjectURL(workerUrl); // Cleanup
-                    resolve();
+                    resolve('foo');
                 } 
                 else if (type === 'error') {
                     worker.terminate();
