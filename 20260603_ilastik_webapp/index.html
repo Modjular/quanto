@@ -526,7 +526,7 @@
         };
 
         // Brush Size
-        document.getElementById('brushSizeRange').oninput = async (e) => {
+        document.getElementById('brushSizeRange').oninput = () => {
             const size = parseInt(document.getElementById('brushSizeRange').value, 10);
             document.getElementById('brushVal').innerText = size;
         };
@@ -617,9 +617,9 @@
     // ── File ingestion ────────────────────────────────────────────────────────
     async function handleFiles(files) {
         for (const file of files) {
-            const validFileTypes = ['.tif','.tiff','.png','.jpg','.jpeg']
-            const isValidFileType = validFileTypes.some((filetype) => file.name.endsWith(filetype))
-            const isDuplicate = state.images.some(img => img.name === file.name && img.fileSize === file.size)
+            const validFileTypes = ['.tif', '.tiff', '.png', '.jpg', '.jpeg'];
+            const isValidFileType = validFileTypes.some((filetype) => file.name.toLowerCase().endsWith(filetype));
+            const isDuplicate = state.images.some(img => img.name === file.name && img.fileSize === file.size);
 
             if (!isDuplicate && isValidFileType) {
                 await addImage(file);
@@ -1041,7 +1041,7 @@
             pixels.forEach(p => ctx.clearRect(p.x, p.y, 1, 1));
 
         } else {
-            console.error("Unrecognized toolmmode:", state.toolMode)
+            console.error("Unrecognized tool mode:", state.toolMode);
         }
 
         updateImageStateBadge(imgState);
@@ -1089,9 +1089,9 @@
 
     function updateImageStateBadge(imgState) {
         const badge = imgState._sidebarRow.querySelector('.img-label-badge');
-        const count = imgState.labels.length
+        const count = imgState.labels.length;
 
-        if (!badge) return
+        if (!badge) return;
 
         badge.textContent = count === 0 ? 'no labels' : `${count} label${count !== 1 ? 's' : ''}`;
         badge.classList.toggle('has-labels', count > 0);
