@@ -131,49 +131,6 @@ export async function buildTrainingDataset(images, totalLabels) {
     return { combinedX, yArray };
 }
 
-
-/**
- * Returns an array of pixel coordinates that fall within a given radius of a center point.
- * @param {number} cx - The x-coordinate of the center.
- * @param {number} cy - The y-coordinate of the center.
- * @param {number} radius - The radius of the circle.
- * @param {number} width - The width of the bounding canvas/image.
- * @param {number} height - The height of the bounding canvas/image.
- * @returns {Array<{x: number, y: number}>} Array of point objects containing the coordinates within the radius.
- */
-export function getPixelsInRadius(cx, cy, radius, width, height) {
-    const pixels = [];
-    
-    // Exact 1-pixel brush
-    if (radius === 1) {
-        if (cx >= 0 && cx < width && cy >= 0 && cy < height) {
-            pixels.push({ x: cx, y: cy });
-        }
-        return pixels;
-    }
-    
-    const rSq = radius * radius;
-    const rInt = Math.ceil(radius);
-    
-    // Check a bounding box around the center
-    for (let y = cy - rInt; y <= cy + rInt; y++) {
-        for (let x = cx - rInt; x <= cx + rInt; x++) {
-            // Keep it inside canvas bounds
-            if (x >= 0 && x < width && y >= 0 && y < height) {
-                const dx = x - cx;
-                const dy = y - cy;
-                
-                // If distance squared is within radius squared, it's inside the circle
-                if (dx * dx + dy * dy <= rSq) {
-                    pixels.push({ x, y });
-                }
-            }
-        }
-    }
-    
-    return pixels;
-}
-
 /**
  * Handles generating ITK images, requesting file permissions, and batching files into ZIPs or directories.
  * @param {Array<Object>} images - Array of image objects to export.
@@ -289,6 +246,48 @@ export async function exportImagesData(images, rf, options) {
         link.click();
         URL.revokeObjectURL(link.href);
     }
+}
+
+/**
+ * Returns an array of pixel coordinates that fall within a given radius of a center point.
+ * @param {number} cx - The x-coordinate of the center.
+ * @param {number} cy - The y-coordinate of the center.
+ * @param {number} radius - The radius of the circle.
+ * @param {number} width - The width of the bounding canvas/image.
+ * @param {number} height - The height of the bounding canvas/image.
+ * @returns {Array<{x: number, y: number}>} Array of point objects containing the coordinates within the radius.
+ */
+export function getPixelsInRadius(cx, cy, radius, width, height) {
+    const pixels = [];
+    
+    // Exact 1-pixel brush
+    if (radius === 1) {
+        if (cx >= 0 && cx < width && cy >= 0 && cy < height) {
+            pixels.push({ x: cx, y: cy });
+        }
+        return pixels;
+    }
+    
+    const rSq = radius * radius;
+    const rInt = Math.ceil(radius);
+    
+    // Check a bounding box around the center
+    for (let y = cy - rInt; y <= cy + rInt; y++) {
+        for (let x = cx - rInt; x <= cx + rInt; x++) {
+            // Keep it inside canvas bounds
+            if (x >= 0 && x < width && y >= 0 && y < height) {
+                const dx = x - cx;
+                const dy = y - cy;
+                
+                // If distance squared is within radius squared, it's inside the circle
+                if (dx * dx + dy * dy <= rSq) {
+                    pixels.push({ x, y });
+                }
+            }
+        }
+    }
+    
+    return pixels;
 }
 
 /**
