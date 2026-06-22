@@ -38,13 +38,14 @@ export class WebGpuBackend {
         });
         this.device.queue.writeTexture({ texture: this.originalTexture }, rgbaData, { bytesPerRow: width * 4 }, [width, height]);
 
+        const numColors = this.labelColors ? this.labelColors.length : 3;
         if (this.probBuffer) this.probBuffer.destroy();
         this.probBuffer = this.device.createBuffer({
-            size: width * height * 4,
+            size: width * height * numColors * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
         });
 
-        const initialProbs = new Float32Array(width * height).fill(-1.0);
+        const initialProbs = new Float32Array(width * height * numColors).fill(-1.0);
         this.device.queue.writeBuffer(this.probBuffer, 0, initialProbs);
     }
 
@@ -308,13 +309,14 @@ export class WebGpuBackend {
         paddedRoots.set(rf.treeRoots);
         this.device.queue.writeBuffer(rootsBuffer, 0, paddedRoots);
 
+        const numColors = this.labelColors ? this.labelColors.length : 3;
+
         if (this.probBuffer) this.probBuffer.destroy();
         this.probBuffer = this.device.createBuffer({
-            size: this.width * this.height * 4,
+            size: this.width * this.height * numColors * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
         });
 
-        const numColors = this.labelColors ? this.labelColors.length : 3;
         const code = shaders.RF_INFERENCE_SHADER
             .replace(/{{WIDTH}}/g, this.width)
             .replace(/{{HEIGHT}}/g, this.height)
@@ -405,7 +407,8 @@ export class WebGpuBackend {
     }
 
     async downloadProbabilities() {
-        const outSize = this.width * this.height;
+        const numColors = this.labelColors ? this.labelColors.length : 3;
+        const outSize = this.width * this.height * numColors;
         const rb = this.device.createBuffer({
             size: outSize * 4,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ

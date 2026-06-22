@@ -265,6 +265,7 @@
                 alert(`Export failed: ${err.message}`);
             } finally {
                 btnExport.disabled = false;
+                btnExport.innerText = 'Export Loaded Images'
             }
         };
     }

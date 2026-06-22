@@ -162,17 +162,25 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
 
     for (let i = 0; i < images.length; i++) {
         const img = images[i];
-
         const probs = await img.backend.downloadProbabilities();
         const w = img.width;
         const h = img.height;
         const baseName = img.name ? img.name.replace(/\.[^/.]+$/, "") : `image_${i}`;
-
+        const numClasses = (probs.length / (w * h));
+        
         if (exportSeg) {
             const dataUint8Array = new Uint8Array(w * h);
-            for (let j = 0; j < probs.length; j++) {
-                const c = probs[j];
-                dataUint8Array[j] = c < 0 ? 0 : c + 1;
+            for (let j = 0; j < w * h; j++) {
+                let max_p = -1.0;
+                let best_class = -1;
+                for (let c = 0; c < numClasses; c++) {
+                    const p = probs[j * numClasses + c];
+                    if (p > max_p) {
+                        max_p = p;
+                        best_class = c;
+                    }
+                }
+                dataUint8Array[j] = max_p < 0 ? 0 : best_class + 1;
             }
 
             const itkImage = {
@@ -203,14 +211,7 @@ export async function exportImagesData(images, outputDirHandle, exportProb, expo
         }
 
         if (exportProb) {
-            const numClasses = rf.numClasses || 2;
-            const dataFloat32Array = new Float32Array(w * h * numClasses);
-            for (let j = 0; j < probs.length; j++) {
-                const c = probs[j];
-                if (c >= 0 && c < numClasses) {
-                    dataFloat32Array[j * numClasses + c] = 1.0;
-                }
-            }
+            const dataFloat32Array = new Float32Array(probs);
 
             const itkImage = {
                 imageType: {
