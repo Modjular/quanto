@@ -143,16 +143,12 @@ export async function buildTrainingDataset(images, totalLabels) {
 /**
  * Handles generating ITK images, requesting file permissions, and batching files into ZIPs or directories.
  * @param {Array<Object>} images - Array of image objects to export.
- * @param {Object} rf - The random forest model used for inference.
- * @param {Object} options - Export configuration options.
- * @param {boolean} [options.exportSeg] - Whether to export segmentation masks.
- * @param {boolean} [options.exportProb] - Whether to export probability maps.
- * @param {FileSystemDirectoryHandle} [options.outputDirHandle] - Optional handle to the output directory. If omitted, exports to a ZIP.
+ * @param {FileSystemDirectoryHandle} outputDirHandle - Optional handle to the output directory. If omitted, exports to a ZIP.
+ * @param {boolean} exportSeg - Whether to export segmentation masks.
+ * @param {boolean} exportProb - Whether to export probability maps.
  * @returns {Promise<void>}
  */
-export async function exportImagesData(images, rf, options) {
-    const { exportSeg, exportProb, outputDirHandle } = options;
-
+export async function exportImagesData(images, outputDirHandle, exportProb, exportSeg) {
     let zip = null;
     if (!outputDirHandle) {
         const JSZip = (await import('https://esm.sh/jszip@3.10.1')).default;
@@ -166,9 +162,6 @@ export async function exportImagesData(images, rf, options) {
 
     for (let i = 0; i < images.length; i++) {
         const img = images[i];
-        
-        // Run inference to ensure textures/buffers are updated
-        await img.backend.runInference(rf);
 
         const probs = await img.backend.downloadProbabilities();
         const w = img.width;

@@ -147,8 +147,8 @@
 <script type="module">
     import { state } from './state.js';
     import { setupCamera } from './camera.js';
-    import { handleFiles, scheduleTrainAndPredictAll } from './imageManager.js';
-    import { syncUI, updateExportButtonCount } from './ui.js';
+    import { handleFiles, trainAndPredictAll, scheduleTrainAndPredictAll } from './imageManager.js';
+    import { syncUI } from './ui.js';
     import { exportImagesData } from './utils.js';
 
     function init() {
@@ -250,19 +250,21 @@
             btnExport.disabled = true;
             btnExport.innerText = 'Training…';
             try {
-                scheduleTrainAndPredictAll()
+                // Train then run inference to ensure textures/buffers are updated
+                await trainAndPredictAll();
                 btnExport.innerText = 'Exporting…';
-                await exportImagesData(state.images, state.rf, {
-                    exportSeg, exportProb,
-                    outputDirHandle: state.outputDirHandle,
-                });
+                await exportImagesData(
+                    state.images,
+                    state.outputDirHandle,
+                    exportSeg,
+                    exportProb,
+                );
                 alert('All images exported successfully!');
             } catch (err) {
                 console.error(err);
                 alert(`Export failed: ${err.message}`);
             } finally {
                 btnExport.disabled = false;
-                updateExportButtonCount();
             }
         };
     }
