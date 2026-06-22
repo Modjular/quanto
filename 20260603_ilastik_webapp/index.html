@@ -116,17 +116,6 @@
                 </label>
             </div>
 
-            <div class="control-group">
-                <span class="control-label">Destination</span>
-                <div id="dirStatus" style="font-size:11px; color:#888;
-                     word-break:break-all;">
-                    ZIP download (default)
-                </div>
-                <button id="btnSetDir" class="btn-subtle">
-                    Set Output Folder…
-                </button>
-            </div>
-
             <button id="btnExportAll" class="btn-success" disabled>
                 Export Loaded Images
             </button>
@@ -220,22 +209,6 @@
             if (state.liveUpdate) scheduleTrainAndPredictAll();
         };
 
-        // Output folder
-        const btnSetDir  = document.getElementById('btnSetDir');
-        const dirStatus  = document.getElementById('dirStatus');
-        if (!('showDirectoryPicker' in window)) {
-            btnSetDir.style.display = 'none';
-            dirStatus.innerText = 'ZIP download (Folder API not supported)';
-        } else {
-            btnSetDir.onclick = async () => {
-                try {
-                    state.outputDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-                    dirStatus.innerText   = `/${state.outputDirHandle.name}/`;
-                    dirStatus.style.color = '#4CAF50';
-                } catch (err) { console.warn(err); }
-            };
-        }
-
         // Export
         const btnExport = document.getElementById('btnExportAll');
         btnExport.onclick = async () => {
@@ -253,9 +226,8 @@
                 // Train then run inference to ensure textures/buffers are updated
                 await trainAndPredictAll();
                 btnExport.innerText = 'Exporting…';
-                await exportImagesData(
+                const foo = await exportImagesData(
                     state.images,
-                    state.outputDirHandle,
                     exportSeg,
                     exportProb,
                 );
