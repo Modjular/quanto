@@ -36,27 +36,36 @@ export async function loadFileIntoArray(file) {
   }
 
   const intensityArray = new Float32Array(w * h);
-
-  // Calculate min/max for normalization
-  let [min, max] = [Infinity, -Infinity]
-  for (let i = 0; i < w * h; i++) {
-    if (data[i] < min) min = data[i];
-    if (data[i] > max) max = data[i];
-  }
-
-  const range = (max - min) > 0 ? (max - min) : 255;
-  for (let i = 0; i < w * h; i++) {
-    const norm = (data[i] - min) / range;
-    intensityArray[i] = norm;
-
-    const val8 = norm * 255;
-    rgba[i * 4] = val8;
-    rgba[i * 4 + 1] = val8;
-    rgba[i * 4 + 2] = val8;
-    rgba[i * 4 + 3] = 255;
-  }
+  intensityToRGBA(data, rgba, intensityArray);
 
   return { intensityArray, rgba, w, h }
+}
+
+/**
+ * Normalizes an intensity array and converts it to RGBA.
+ * @param {Float32Array|Array} data - The input data to normalize.
+ * @param {Uint8Array|Uint8ClampedArray} rgba - Array to write RGBA values.
+ * @param {Float32Array} [intensityArray] - Optional array to write normalized intensities.
+ */
+export function intensityToRGBA(data, rgba, intensityArray) {
+    let [min, max] = [Infinity, -Infinity];
+    const n = data.length;
+    for (let i = 0; i < n; i++) {
+        if (data[i] < min) min = data[i];
+        if (data[i] > max) max = data[i];
+    }
+
+    const range = (max - min) > 0 ? (max - min) : 255;
+    for (let i = 0; i < n; i++) {
+        const norm = (data[i] - min) / range;
+        if (intensityArray) intensityArray[i] = norm;
+
+        const val8 = norm * 255;
+        rgba[i * 4] = val8;
+        rgba[i * 4 + 1] = val8;
+        rgba[i * 4 + 2] = val8;
+        rgba[i * 4 + 3] = 255;
+    }
 }
 
 /**
