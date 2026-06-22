@@ -67,16 +67,9 @@ export const RF_INFERENCE_SHADER = `
             }
         }
 
-        var max_votes = -1.0;
-        var best_class = -1.0;
         for (var c = 0; c < {{NUM_COLORS}}; c++) {
-            if (votes[c] > max_votes) {
-                max_votes = votes[c];
-                best_class = f32(c);
-            }
+            output[pixel_idx * {{NUM_COLORS}}u + u32(c)] = votes[c] / f32(num_trees);
         }
-
-        output[pixel_idx] = best_class;
     }
 `;
 
@@ -107,19 +100,29 @@ export const COMPOSITE_SHADER = `
         let h = u32({{HEIGHT}});
         let x = u32(uv.x * f32(w));
         let y = u32(uv.y * f32(h));
-        let p = p_map[clamp(y * w + x, 0u, w * h - 1u)];
+        
+        let base_idx = clamp(y * w + x, 0u, w * h - 1u) * {{NUM_COLORS}}u;
+        var max_p: f32 = -1.0;
+        var best_class: i32 = -1;
+        
+        for (var c = 0u; c < {{NUM_COLORS}}u; c++) {
+            let p = p_map[base_idx + c];
+            if (p > max_p) {
+                max_p = p;
+                best_class = i32(c);
+            }
+        }
         
         var alpha: f32 = 0.4;
-        if (p < 0.0) { return vec4(raw.rgb, 1.0); }
+        if (max_p < 0.0) { return vec4(raw.rgb, 1.0); }
         
         var colors = array<vec4<f32>, {{NUM_COLORS}}>(
             {{COLORS_ARRAY}}
         );
 
-        let class_idx = i32(p + 0.5);
         var overlay = vec4<f32>(0.0, 0.0, 0.0, alpha);
-        if (class_idx >= 0 && class_idx < {{NUM_COLORS}}) {
-            overlay = colors[class_idx];
+        if (best_class >= 0 && best_class < {{NUM_COLORS}}) {
+            overlay = colors[best_class];
             overlay.a = alpha;
         }
 
