@@ -83,8 +83,7 @@ export async function addImage(file) {
     container.appendChild(tileLabel);
     document.getElementById('canvas-board').appendChild(container);
 
-    const backend = new WebGpuBackend();
-    backend.labelColors = LABEL_COLORS;
+    const backend = new WebGpuBackend(LABEL_COLORS);
     try {
         await backend.initialize(gpuCanvas);
     } catch (err) {
