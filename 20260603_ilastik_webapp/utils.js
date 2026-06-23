@@ -7,7 +7,7 @@ import { readImage, writeImage } from "https://cdn.jsdelivr.net/npm/@itk-wasm/im
  * @returns {Promise<{intensityArray: Float32Array, rgba: Uint8Array|Uint8ClampedArray, w: number, h: number}>} An object containing the normalized intensity array, the raw RGBA array, and the dimensions.
  */
 export async function loadFileIntoArray(file) {
-  let data, rgba, w, h;
+  let data, rgba, w, h, shape;
 
   if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
     const { image } = await readImage(file)
@@ -16,6 +16,7 @@ export async function loadFileIntoArray(file) {
     h = image.size[1]
     rgba = new Uint8Array(image.data.length * 4)
     data = image.data
+    shape = image.size
   } else {
     const img = await createImageBitmap(file);
     w = img.width;
@@ -25,6 +26,7 @@ export async function loadFileIntoArray(file) {
     ctx.drawImage(img, 0, 0);
     rgba = ctx.getImageData(0, 0, w, h).data;
     data = new Float32Array(w * h)
+    shape = [w, h]
 
     // Convert RGBA to intensity
     for (let i = 0; i < w * h; i++) {
@@ -38,7 +40,7 @@ export async function loadFileIntoArray(file) {
   const intensityArray = new Float32Array(w * h);
   intensityToRGBA(data, rgba, intensityArray);
 
-  return { intensityArray, rgba, w, h }
+  return { intensityArray, rgba, w, h, shape}
 }
 
 /**

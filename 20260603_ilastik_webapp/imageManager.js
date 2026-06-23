@@ -50,6 +50,15 @@ export async function addImage(file) {
         syncUI();
         return;
     }
+
+    // TODO: 20260623 -- Support 3D images
+    if (loaded.shape.length > 2) {
+      console.warn(`Only 2D images are currently supported. ${file.name} is (${shape})`);
+      row.remove();
+      syncUI();
+      return;
+    }
+
     const { intensityArray, rgba, w, h, shape } = loaded;
     const imgShape = shape ?? [h, w];
 
@@ -123,7 +132,8 @@ export async function addImage(file) {
         paint(e, imgState);
     });
     labelCanvas.addEventListener('mousemove', (e) => {
-        if (state.isDrawing && state.activeImageId === imgId && !state.isSpaceDown && state.toolMode !== 'grab') {
+        if (state.isSpaceDown) return
+        if (state.isDrawing && state.activeImageId === imgId && state.toolMode !== 'grab') {
             paint(e, imgState);
         }
     });
