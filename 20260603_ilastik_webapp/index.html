@@ -9,7 +9,6 @@
 </head>
 <body class="mode-grab">
 
-<!-- ── Top bar ────────────────────────────────────────────────────────────── -->
 <div id="top-bar">
     <h2 style="margin:0; font-size:18px; color:#007acc;">
         ilastik <span style="color:#eee; font-weight:300;">webgpu</span>
@@ -17,13 +16,10 @@
     <div id="status">No images loaded. Drag &amp; drop onto the canvas.</div>
 </div>
 
-<!-- ── Main layout ────────────────────────────────────────────────────────── -->
 <div id="main-container">
 
-    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
     <div id="sidebar">
 
-        <!-- ── Section 1: Ingest ────────────────────────────────────────── -->
         <div class="sidebar-section" id="section-ingest">
             <div class="section-header">Images</div>
             
@@ -35,19 +31,13 @@
             </div>
 
             <div id="image-list"></div>
-
-            <p class="hint">
-                Drag files onto the canvas to load them.<br>
-                Use ▲▼ to reorder. Delete removes labels &amp; retrains.
-            </p>
         </div>
 
-        <!-- ── Section 2: Train ─────────────────────────────────────────── -->
         <div class="sidebar-section" id="section-train">
             <div class="section-header">Train</div>
 
             <div class="control-group">
-                <span class="control-label">Tools &amp; Brush Size</span>
+                <span class="control-label">Tools</span>
                 <div style="display:flex; gap:10px; align-items:end;">
                     <div style="display:flex; gap:4px; flex:1;">
                         <button class="tool-btn active" data-tool="grab" title="Grab (Pan)">🖐</button>
@@ -78,7 +68,18 @@
                 </div>
             </div>
 
-            <button id="btnTrain" disabled>Live Update: OFF</button>
+            <div class="heavy-panel">
+                <div class="heavy-panel-header">
+                    <span class="heavy-panel-title">Real-Time Prediction</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="btnTrain" disabled>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <p class="heavy-panel-desc">
+                    Real-time prediction is compute intense. Performance may degrade with larger image stacks.
+                </p>
+            </div>
 
             <p class="hint">
                 Paint labels on the canvas, then enable Live Update to see
@@ -86,7 +87,6 @@
             </p>
         </div>
 
-        <!-- ── Section 3: Export ────────────────────────────────────────── -->
         <div class="sidebar-section" id="section-export">
             <div class="section-header">Export</div>
 
@@ -114,7 +114,6 @@
 
     </div>
 
-    <!-- ── Viewport ─────────────────────────────────────────────────────── -->
     <div id="viewport">
         <div id="canvas-board"></div>
     </div>
@@ -197,10 +196,8 @@
 
         // Live update
         const btnTrain = document.getElementById('btnTrain');
-        btnTrain.onclick = () => {
-            state.liveUpdate = !state.liveUpdate;
-            btnTrain.innerText = state.liveUpdate ? 'Live Update: ON' : 'Live Update: OFF';
-            btnTrain.style.background = state.liveUpdate ? '#4CAF50' : '';
+        btnTrain.onchange = (e) => {
+            state.liveUpdate = e.target.checked;
             if (state.liveUpdate) scheduleTrainAndPredictAll();
         };
 
@@ -250,7 +247,6 @@
     }
 
     init();
-
 
 </script>
 </body>
