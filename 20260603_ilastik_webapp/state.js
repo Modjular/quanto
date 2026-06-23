@@ -1,9 +1,11 @@
 import { FlatRandomForest } from './rf.js';
 
 export const LABEL_COLORS = [
-    'rgba(255,0,255,1.0)',
-    'rgba(0,255,0,1.0)',
-    'rgba(0,0,255,1.0)',
+    '#ff595e',
+    '#ffca3a',
+    '#8ac926',
+    '#1982c4',
+
 ];
 export const RF_CONFIG = { numTrees: 8, maxDepth: 8, numClasses: LABEL_COLORS.length };
 export const MIN_LABELS_TO_TRAIN = 5;

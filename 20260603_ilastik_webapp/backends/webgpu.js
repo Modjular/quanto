@@ -1,7 +1,7 @@
 import * as shaders from './webgpu-shaders.js';
 
 export class WebGpuBackend {
-    constructor() {
+    constructor(labelColors) {
         this.device = null;
         this.context = null;
         this.format = null;
@@ -10,6 +10,11 @@ export class WebGpuBackend {
         this.originalTexture = null;
         this.featureBuffer = null;
         this.probBuffer = null;
+        this.labelColors = labelColors || [
+            'rgba(255,0,0,1.0)',
+            'rgba(0,255,0,1.0)',
+            'rgba(0,0,255,1.0)',
+        ];
     }
 
     async initialize(canvas) {
@@ -38,7 +43,7 @@ export class WebGpuBackend {
         });
         this.device.queue.writeTexture({ texture: this.originalTexture }, rgbaData, { bytesPerRow: width * 4 }, [width, height]);
 
-        const numColors = this.labelColors ? this.labelColors.length : 3;
+        const numColors = this.labelColors.length;
         if (this.probBuffer) this.probBuffer.destroy();
         this.probBuffer = this.device.createBuffer({
             size: width * height * numColors * 4,
@@ -309,7 +314,7 @@ export class WebGpuBackend {
         paddedRoots.set(rf.treeRoots);
         this.device.queue.writeBuffer(rootsBuffer, 0, paddedRoots);
 
-        const numColors = this.labelColors ? this.labelColors.length : 3;
+        const numColors = this.labelColors.length;
 
         if (this.probBuffer) this.probBuffer.destroy();
         this.probBuffer = this.device.createBuffer({
@@ -352,16 +357,25 @@ export class WebGpuBackend {
     renderComposite() {
         if (!this.originalTexture || !this.probBuffer) return;
 
-        const colors = this.labelColors || [
-            'rgba(255,0,255,1.0)',
-            'rgba(0,255,0,1.0)',
-            'rgba(0,0,255,1.0)',
-        ];
+        const colors = this.labelColors
 
         function parseColor(c) {
+            // rgba
             let m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*([\d.]+)?\)/);
             if (m) {
-                return `vec4<f32>(${(m[1]/255).toFixed(3)}, ${(m[2]/255).toFixed(3)}, ${(m[3]/255).toFixed(3)}, ${m[4] || '1.0'})`;
+                const r = (m[1]/255).toFixed(3);
+                const g = (m[2]/255).toFixed(3);
+                const b = (m[3]/255).toFixed(3);
+                return `vec4<f32>(${r}, ${g}, ${b}, ${m[4] || '0.8'})`;
+            }
+
+            // hex
+            m = c.match(/^#([0-9a-f]{6})$/i)[1];
+            if(m) {
+                const r = (parseInt(m.substr(0,2),16)/255).toFixed(3);
+                const g = (parseInt(m.substr(2,2),16)/255).toFixed(3);
+                const b = (parseInt(m.substr(4,2),16)/255).toFixed(3);
+                return `vec4<f32>(${r}, ${g}, ${b}, 0.8)`;
             }
             return "vec4<f32>(1.0, 0.0, 0.0, 1.0)";
         }
@@ -407,7 +421,7 @@ export class WebGpuBackend {
     }
 
     async downloadProbabilities() {
-        const numColors = this.labelColors ? this.labelColors.length : 3;
+        const numColors = this.labelColors.length;
         const outSize = this.width * this.height * numColors;
         const rb = this.device.createBuffer({
             size: outSize * 4,

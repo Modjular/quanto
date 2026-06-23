@@ -67,20 +67,7 @@
 
             <div class="control-group">
                 <span class="control-label">Classes</span>
-                <div class="class-selector">
-                    <div class="class-item active" data-class="0">
-                        <div class="color-box" style="background:red;"></div>
-                        <span contenteditable>Class 1</span>
-                    </div>
-                    <div class="class-item" data-class="1">
-                        <div class="color-box" style="background:green;"></div>
-                        <span contenteditable>Class 2</span>
-                    </div>
-                    <div class="class-item" data-class="2">
-                        <div class="color-box" style="background:blue;"></div>
-                        <span contenteditable>Class 3</span>
-                    </div>
-                </div>
+                <div class="class-selector"></div>
             </div>
 
             <div class="control-group">
@@ -134,7 +121,7 @@
 
 </div>
 <script type="module">
-    import { state } from './state.js';
+    import { state, LABEL_COLORS } from './state.js';
     import { setupCamera } from './camera.js';
     import { handleFiles, trainAndPredictAll, scheduleTrainAndPredictAll } from './imageManager.js';
     import { syncUI } from './ui.js';
@@ -190,6 +177,14 @@
                 document.body.classList.add(`mode-${state.toolMode}`);
             };
         });
+
+        // TODO: Use state.rf.numColors as source of truth instead
+        document.querySelector('.class-selector').innerHTML = LABEL_COLORS.map((color, index) => `
+            <div class="class-item ${index === 0 ? 'active' : ''}" data-class="${index}">
+                <div class="color-box" style="background:${color};"></div>
+                <span contenteditable>Class ${index + 1}</span>
+            </div>
+        `).join('');
 
         // Class selector
         document.querySelectorAll('.class-item').forEach(el => {
