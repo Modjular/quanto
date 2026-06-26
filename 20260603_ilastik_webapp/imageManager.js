@@ -1,5 +1,6 @@
 import { state, LABEL_COLORS, MIN_LABELS_TO_TRAIN, RF_CONFIG, TRAIN_DEBOUNCE_MS } from './state.js';
 import { WebGpuBackend } from './backends/webgpu.js';
+import { WebGl2Backend } from './backends/webgl2.js';
 import { loadFileIntoArray, buildTrainingDataset, inferAxes, pickSlice, getPixelsInRadius, intensityToRGBA } from './utils.js';
 import { createImageRow, finaliseImageRow, showAxesUI, syncUI, updateImageStateBadge } from './ui.js';
 
@@ -31,6 +32,34 @@ export async function handleFiles(files) {
             await addImage(file);
         }
     }
+}
+
+async function initializeBackend(canvas, labelColors) {
+  // 1. Try WebGPU first
+  if (navigator.gpu) {
+      try {
+          const backend = new WebGpuBackend(labelColors);
+          await backend.initialize(canvas);
+          console.log("WebGPU initialized successfully.");
+          return backend;
+      } catch (e) {
+          console.warn("WebGPU initialization failed, falling back to WebGL2:", e);
+      }
+  }
+
+  // 2. Fallback to WebGL2
+  try {
+      const backend = new WebGl2Backend(labelColors);
+      await backend.initialize(canvas);
+      console.log("WebGL2 initialized successfully.");
+      return backend;
+  } catch (e) {
+      console.error("WebGL2 initialization failed:", e);
+  }
+
+  // 3. Final error handling
+  alert("Your browser does not support the required graphics APIs (WebGPU or WebGL2).");
+  throw new Error("No compatible rendering backend found.");
 }
 
 export async function addImage(file) {
@@ -92,12 +121,12 @@ export async function addImage(file) {
     container.appendChild(tileLabel);
     document.getElementById('canvas-board').appendChild(container);
 
-    const backend = new WebGpuBackend(LABEL_COLORS);
+    let backend = null;
+  
     try {
-        await backend.initialize(gpuCanvas);
+        backend = await initializeBackend(gpuCanvas, LABEL_COLORS)
     } catch (err) {
         console.error(err);
-        alert('WebGPU not supported or initialization failed.');
         container.remove();
         row.remove();
         syncUI();
