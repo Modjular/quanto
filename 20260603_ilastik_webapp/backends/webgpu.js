@@ -130,7 +130,7 @@ export class WebGpuBackend {
     /**
      * Compiles area and cumulative intensity metric profiles per label ID.
      */
-    async computeStats(rawIntensityBuffer, maxExpectedLabels = 50000) {
+    async computeStats(maxExpectedLabels = 50000) {
         // 2 elements per label structure: [u32 area, u32 total_intensity]
         const statsSize = maxExpectedLabels * 2 * 4; 
 
@@ -144,17 +144,6 @@ export class WebGpuBackend {
         const clearEncoder = this.device.createCommandEncoder();
         clearEncoder.clearBuffer(this.statsBuffer, 0, statsSize);
         this.device.queue.submit([clearEncoder.finish()]);
-
-        let gpuRawInput;
-        if (rawIntensityBuffer instanceof GPUBuffer) {
-            gpuRawInput = rawIntensityBuffer;
-        } else {
-            gpuRawInput = this.device.createBuffer({
-                size: rawIntensityBuffer.byteLength,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-            });
-            this.device.queue.writeBuffer(gpuRawInput, 0, rawIntensityBuffer);
-        }
 
         const code = STATS_ACCUMULATOR_SHADER
             .replace(/{{WIDTH}}/g, this.width)
@@ -171,7 +160,7 @@ export class WebGpuBackend {
             layout: pipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.labelBuffer } },
-                { binding: 1, resource: { buffer: gpuRawInput } },
+                { binding: 1, resource: { buffer: this.originalTexture } },
                 { binding: 2, resource: { buffer: this.statsBuffer } }
             ]
         });
@@ -183,10 +172,6 @@ export class WebGpuBackend {
         pass.dispatchWorkgroups(Math.ceil(this.width / 16), Math.ceil(this.height / 16));
         pass.end();
         this.device.queue.submit([enc.finish()]);
-
-        if (!(rawIntensityBuffer instanceof GPUBuffer)) {
-            gpuRawInput.destroy();
-        }
 
         return this.statsBuffer;
     }
