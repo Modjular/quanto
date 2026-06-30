@@ -121,7 +121,7 @@ export async function buildTrainingDataset(images, totalLabels) {
 export async function zipImages(images, exportSeg, exportProb, progressCallback) {
     // Array to temporarily hold file data if we are zipping
     const filesToZip = [];
-    const callback = progressCallback || ((m) => console.log(m))
+    const callback = progressCallback || ((m) => console.log(m));
 
     for (let i = 0; i < images.length; i++) {
         const img = images[i];
@@ -162,10 +162,9 @@ export async function zipImages(images, exportSeg, exportProb, progressCallback)
                 data: dataUint8Array
             };
 
-            const filename = `${baseName}_segmentation.tif`;
-            const { serializedImage } = await writeImage(itkImage, `${itkImage.name}.tif`);
-            
-            // Store the raw ArrayBuffer for the worker
+            const filename = `${itkImage.name}.tif`;
+            const { serializedImage } = await writeImage(itkImage, filename);
+
             filesToZip.push({ name: filename, data: serializedImage.data.buffer });
         }
 
@@ -188,10 +187,9 @@ export async function zipImages(images, exportSeg, exportProb, progressCallback)
                 data: dataFloat32Array
             };
 
-            const filename = `${baseName}_probabilities.tif`;
-            const { serializedImage } = await writeImage(itkImage, `${itkImage.name}.tif`);
-            
-            // Store the raw ArrayBuffer for the worker
+            const filename = `${itkImage.name}.tif`;
+            const { serializedImage } = await writeImage(itkImage, filename);
+
             filesToZip.push({ name: filename, data: serializedImage.data.buffer });
         }
     }
