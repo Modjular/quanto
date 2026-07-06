@@ -204,21 +204,33 @@ export async function zipImages(images, exportSeg, exportProb, progressCallback)
             const labels = await img.backend.downloadLabels()
             const data = await img.backend.downloadStats()
 
-            const statsStructCount = 6;
-            const numLabels = data.length / statsStructCount
-            console.log("unique vs numLabels", new Set(labels).length, numLabels)
+            /**
+             * struct DenseMetrics {
+             *     label: u32,
+             *     area: u32,
+             *     total_intensity: u32,
+             *     sum_x: u32,
+             *     sum_y: u32,
+             *     min_intensity: u32,
+             *     max_intensity: u32
+             * };
+             */
 
-            for (let label = 1; label < numLabels; label++) {
-                const baseIdx = label * statsStructCount;
-                const area = data[baseIdx + 0];
+            const statsStructCount = 7;
+            const numLabels = data.length / statsStructCount
+            console.log("unique vs numLabels", new Set(labels).size, numLabels)
+
+            for (let i = 0; i < 10 * statsStructCount; i += statsStructCount) {
+                const label = data[i + 0]
+                const area = data[i + 1];
                 
                 if (area === 0) continue; // Label not present
 
-                const totalIntensity = data[baseIdx + 1];
-                const sumX = data[baseIdx + 2];
-                const sumY = data[baseIdx + 3];
-                const minIntensityRaw = data[baseIdx + 4];
-                const maxIntensityRaw = data[baseIdx + 5];
+                const totalIntensity = data[i + 2];
+                const sumX = data[i + 3];
+                const sumY = data[i + 4];
+                const minIntensityRaw = data[i + 5];
+                const maxIntensityRaw = data[i + 6];
 
                 // Compute the averages
                 const centroidX = sumX / area;
@@ -230,7 +242,7 @@ export async function zipImages(images, exportSeg, exportProb, progressCallback)
                 const maxIntensity = maxIntensityRaw / 10000.0;
                 const avgIntensity = avgIntensityRaw / 10000.0;
                 
-                // console.log(`Label ${label}: Centroid(${centroidX.toFixed(2)}, ${centroidY.toFixed(2)}), Intensity[Min: ${minIntensity}, Max: ${maxIntensity}, Avg: ${avgIntensity.toFixed(2)}]`);
+                console.log(`Label ${label}: Centroid(${centroidX.toFixed(2)}, ${centroidY.toFixed(2)}), Intensity[Min: ${minIntensity}, Max: ${maxIntensity}, Avg: ${avgIntensity.toFixed(2)}]`);
             }
 
             // TODO: Waiting on bugfix from itk-wasm

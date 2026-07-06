@@ -8,10 +8,9 @@ export class WebGpuBackend {
         this.originalTexture = null;
         this.featureBuffer = null;
         this.probBuffer = null;
-        
-        // New buffers for Topology and Analysis
         this.labelBuffer = null;
         this.statsBuffer = null;
+        this.statsCounterBuffer = null;
 
         this.labelColors = labelColors || [
             'rgba(255,0,0,1.0)',
@@ -177,7 +176,6 @@ export class WebGpuBackend {
             ]
         });
 
-        // We also need a staging buffer to read the result back to the CPU
         const maxStagingBuffer = this.device.createBuffer({
             size: 4,
             usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
@@ -187,14 +185,12 @@ export class WebGpuBackend {
         const maxPass = maxEncoder.beginComputePass();
         maxPass.setPipeline(maxPipeline);
         maxPass.setBindGroup(0, maxBindGroup);
-        // Use a 2D dispatch matching the image dimensions
         maxPass.dispatchWorkgroups(
             Math.ceil(this.width / 16), 
             Math.ceil(this.height / 16)
         );
         maxPass.end();
-        
-        // Copy the result to the staging buffer
+
         maxEncoder.copyBufferToBuffer(maxLabelBuffer, 0, maxStagingBuffer, 0, 4);
         this.device.queue.submit([maxEncoder.finish()]);
 
@@ -203,12 +199,11 @@ export class WebGpuBackend {
         const maxLabelArray = new Uint32Array(maxStagingBuffer.getMappedRange());
         const maxLabel = maxLabelArray[0];
         maxStagingBuffer.unmap();
-        
-        // Clean up the temporary max buffers
+
         maxLabelBuffer.destroy();
         maxStagingBuffer.destroy();
 
-        // If the max label is 0, the image is empty. Bail out early!
+        // If the max label is 0, the image is empty.
         if (maxLabel === 0) return null;
 
         // Labels are 0-indexed, so the required size is maxLabel + 1
@@ -227,7 +222,6 @@ export class WebGpuBackend {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
         });
 
-        // Initialize CPU-side array to handle the min_intensity starting value
         const initData = new Uint32Array(maxExpectedLabels * statsStructCount);
         for (let i = 0; i < maxExpectedLabels; i++) {
             initData[i * statsStructCount + 4] = 0xFFFFFFFF; // Set min_intensity to max u32
@@ -263,31 +257,104 @@ export class WebGpuBackend {
         statsPass.end();
         this.device.queue.submit([statsEncoder.finish()]);
 
-        return this.statsBuffer;
+        // =========================================================
+        // PASS 3: Stream Compaction (Sparse -> Dense)
+        // =========================================================
+
+        const counterBuffer = this.device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+        });
+        this.device.queue.writeBuffer(counterBuffer, 0, new Uint32Array([0]));
+
+        const denseStructCount = 7;
+        const maxDenseSize = maxExpectedLabels * denseStructCount * 4;
+        const compactStatsBuffer = this.device.createBuffer({
+            size: maxDenseSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+
+        const compactCode = COMPACT_STATS_SHADER
+            .replace(/{{WIDTH}}/g, this.width)
+            .replace(/{{HEIGHT}}/g, this.height)
+            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels);
+
+        const compactModule = this.device.createShaderModule({ code: compactCode });
+        const compactPipeline = this.device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: compactModule, entryPoint: 'main' }
+        });
+
+        const compactBindGroup = this.device.createBindGroup({
+            layout: compactPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.statsBuffer } },   // The sparse buffer
+                { binding: 1, resource: { buffer: compactStatsBuffer } }, // The dense buffer
+                { binding: 2, resource: { buffer: counterBuffer } }       // The atomic counter
+            ]
+        });
+
+        const compactEncoder = this.device.createCommandEncoder();
+        const compactPass = compactEncoder.beginComputePass();
+        compactPass.setPipeline(compactPipeline);
+        compactPass.setBindGroup(0, compactBindGroup);
+        compactPass.dispatchWorkgroups(
+            Math.ceil(this.width / 16), 
+            Math.ceil(this.height / 16)
+        ); 
+        compactPass.end();
+
+        this.device.queue.submit([compactEncoder.finish()]);
+
+        if (this.statsBuffer) this.statsBuffer.destroy();
+        if (this.statsCounterBuffer) this.statsCounterBuffer.destroy();
+        this.statsBuffer = compactStatsBuffer; 
+        this.statsCounterBuffer = counterBuffer;
     }
 
     async downloadStats() {
-        const byteSize = this.statsBuffer.size;
-        const stagingBuffer = this.device.createBuffer({
-            size: byteSize,
+        const denseBuffer = this.statsBuffer
+        const counterBuffer = this.statsCounterBuffer
+
+        const counterStaging = this.device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+        
+        let encoder = this.device.createCommandEncoder();
+        encoder.copyBufferToBuffer(counterBuffer, 0, counterStaging, 0, 4);
+        this.device.queue.submit([encoder.finish()]);
+        
+        await counterStaging.mapAsync(GPUMapMode.READ);
+        const numObjects = new Uint32Array(counterStaging.getMappedRange())[0];
+        counterStaging.unmap();
+        counterStaging.destroy();
+
+        // If no objects were found, bail early!
+        if (numObjects === 0) return new Uint32Array(0);
+
+        const denseStructCount = 7; // label, area, total_intensity, sum_x, sum_y, min, max
+        const bytesToCopy = numObjects * denseStructCount * 4;
+
+        const dataStaging = this.device.createBuffer({
+            size: bytesToCopy,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
         });
 
-        const copyEncoder = this.device.createCommandEncoder();
-        copyEncoder.copyBufferToBuffer(
-            this.statsBuffer, 0, // Source buffer & offset
-            stagingBuffer, 0,    // Destination buffer & offset
-            byteSize             // Number of bytes to copy
+        encoder = this.device.createCommandEncoder();
+        encoder.copyBufferToBuffer(
+            denseBuffer, 0,    // Source
+            dataStaging, 0,    // Destination
+            bytesToCopy        // Only the data, no air
         );
-        this.device.queue.submit([copyEncoder.finish()]);
+        this.device.queue.submit([encoder.finish()]);
 
-        await stagingBuffer.mapAsync(GPUMapMode.READ);
-        const data = new Uint32Array(stagingBuffer.getMappedRange()).slice();
+        await dataStaging.mapAsync(GPUMapMode.READ);
+        const data = new Uint32Array(dataStaging.getMappedRange()).slice();
+        dataStaging.unmap();
+        dataStaging.destroy();
 
-        stagingBuffer.unmap();
-        stagingBuffer.destroy();
-
-        return data
+        return data;
     }
 
     /**
@@ -1065,5 +1132,59 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Evaluate Min/Max
     atomicMin(&stats[label].min_intensity, intensity_u);
     atomicMax(&stats[label].max_intensity, intensity_u);
+}
+`;
+
+const COMPACT_STATS_SHADER = `
+struct SparseMetrics {
+    area: atomic<u32>,
+    total_intensity: atomic<u32>,
+    sum_x: atomic<u32>,
+    sum_y: atomic<u32>,
+    min_intensity: atomic<u32>,
+    max_intensity: atomic<u32>
+};
+
+struct DenseMetrics {
+    label: u32,
+    area: u32,
+    total_intensity: u32,
+    sum_x: u32,
+    sum_y: u32,
+    min_intensity: u32,
+    max_intensity: u32
+};
+
+@group(0) @binding(0) var<storage, read_write> sparse_stats: array<SparseMetrics>;
+@group(0) @binding(1) var<storage, read_write> compact_stats: array<DenseMetrics>;
+@group(0) @binding(2) var<storage, read_write> counter: atomic<u32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let w = {{WIDTH}}u;
+    let h = {{HEIGHT}}u;
+    
+    // Check texture bounds
+    if (id.x >= w || id.y >= h) { return; }
+    
+    // Map 2D coordinates to the 1D label index
+    let label_idx = id.y * w + id.x;
+    
+    // Check against the maximum expected labels found in Pass 1
+    if (label_idx >= {{MAX_LABELS}}u) { return; }
+    if (label_idx == 0u) { return; }
+
+    let area = atomicLoad(&sparse_stats[label_idx].area);
+    if (area > 0u) {
+        let write_idx = atomicAdd(&counter, 1u);
+        
+        compact_stats[write_idx].label = label_idx;
+        compact_stats[write_idx].area = area;
+        compact_stats[write_idx].total_intensity = atomicLoad(&sparse_stats[label_idx].total_intensity);
+        compact_stats[write_idx].sum_x = atomicLoad(&sparse_stats[label_idx].sum_x);
+        compact_stats[write_idx].sum_y = atomicLoad(&sparse_stats[label_idx].sum_y);
+        compact_stats[write_idx].min_intensity = atomicLoad(&sparse_stats[label_idx].min_intensity);
+        compact_stats[write_idx].max_intensity = atomicLoad(&sparse_stats[label_idx].max_intensity);
+    }
 }
 `;
