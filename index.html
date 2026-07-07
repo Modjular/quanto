@@ -103,7 +103,7 @@
     import { state, LABEL_COLORS } from './js/state.js';
     import { scheduleTraining } from './js/training.js'
     import { setupCamera } from './js/camera.js';
-    import { handleFiles } from './js/images.js';
+    import { addFiles } from './js/images.js';
     import { zipImages } from './js/export.js';
 
     function init() {
@@ -116,7 +116,7 @@
     function setupUI() {
         // File input
         document.getElementById('fileInput').onchange = (e) =>
-            handleFiles(e.target.files).catch(console.error);
+            addFiles(state, e.target.files).catch(console.error);
 
         // Viewport drag-and-drop
         const viewport = document.getElementById('viewport');
@@ -125,7 +125,7 @@
         viewport.ondrop      = (e) => {
             e.preventDefault();
             viewport.classList.remove('drag-active');
-            handleFiles(e.dataTransfer.files).catch(console.error);
+            addFiles(state, e.dataTransfer.files).catch(console.error);
         };
 
         // Sigma

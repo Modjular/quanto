@@ -1,22 +1,10 @@
-import { state, LABEL_COLORS, RF_CONFIG } from './state.js';
+import { LABEL_COLORS, RF_CONFIG } from './state.js';
 import { WebGpuBackend } from './backends/webgpu.js';
 import { WebGl2Backend } from './backends/webgl2.js';
 import { loadFileIntoArray } from './io.js';
 import { createImageRow, syncUI, updateImageStateBadge } from './ui.js';
 import { scheduleTraining } from './training.js';
 
-
-export async function handleFiles(files) {
-    for (const file of files) {
-        const validFileTypes = ['.tif', '.tiff', '.png', '.jpg', '.jpeg'];
-        const isValidFileType = validFileTypes.some((filetype) => file.name.toLowerCase().endsWith(filetype));
-        const isDuplicate = state.images.some(img => img.name === file.name && img.fileSize === file.size);
-
-        if (!isDuplicate && isValidFileType) {
-            await addImage(file);
-        }
-    }
-}
 
 async function initializeBackend(canvas, labelColors) {
   // 1. Try WebGPU first
@@ -46,11 +34,23 @@ async function initializeBackend(canvas, labelColors) {
   throw new Error("No compatible rendering backend found.");
 }
 
-export async function addImage(file) {
+export async function addFiles(state, files) {
+    for (const file of files) {
+        const validFileTypes = ['.tif', '.tiff', '.png', '.jpg', '.jpeg'];
+        const isValidFileType = validFileTypes.some((filetype) => file.name.toLowerCase().endsWith(filetype));
+        const isDuplicate = state.images.some(img => img.name === file.name && img.fileSize === file.size);
+
+        if (!isDuplicate && isValidFileType) {
+            await addImage(file, state);
+        }
+    }
+}
+
+export async function addImage(state, file) {
     const imgId = crypto.randomUUID();
     const row   = createImageRow(imgId, file.name, {
-        onReorder: (dir) => reorderImage(imgId, dir),
-        onDelete:  ()    => deleteImage(imgId),
+        onReorder: (dir) => reorderImage(state, imgId, dir),
+        onDelete:  ()    => deleteImage(state, imgId),
     });
     row.classList.add('loading');
     document.getElementById('img-empty').style.display = 'none';
@@ -131,12 +131,12 @@ export async function addImage(file) {
         imgState._cachedRect = labelCanvas.getBoundingClientRect();
         state.isDrawing    = true;
         state.activeImageId = imgId;
-        paint(e, imgState);
+        paint(state, imgState, e);
     });
     labelCanvas.addEventListener('mousemove', (e) => {
         if (state.isSpaceDown) return
         if (state.isDrawing && state.activeImageId === imgId && state.toolMode !== 'grab') {
-            paint(e, imgState);
+            paint(state, imgState, e);
         }
     });
     labelCanvas.addEventListener('mouseup', () => {
@@ -156,7 +156,7 @@ export async function addImage(file) {
     syncUI();
 }
 
-export function reorderImage(imgId, direction) {
+export function reorderImage(state, imgId, direction) {
     const idx = state.images.findIndex(i => i.id === imgId);
     if (idx === -1) return;
     const newIdx = idx + direction;
@@ -180,7 +180,7 @@ export function reorderImage(imgId, direction) {
     else                  list.insertBefore(rb, ra);
 }
 
-export function deleteImage(imgId) {
+export function deleteImage(state, imgId) {
     const idx = state.images.findIndex(i => i.id === imgId);
     if (idx === -1) return;
 
@@ -247,7 +247,7 @@ function getPixelsInRadius(cx, cy, radius, width, height) {
     return pixels;
 }
 
-export function paint(e, imgState) {
+export function paint(state, imgState, e) {
     const rect   = imgState._cachedRect || imgState.labelCanvas.getBoundingClientRect();
     const scaleX = imgState.width  / rect.width;
     const scaleY = imgState.height / rect.height;
