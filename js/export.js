@@ -1,4 +1,5 @@
 import { writeImage, setPipelinesBaseUrl } from './vendor/itk-wasm-image-io.min.js';
+import { STATS_LAYOUT } from './config.js';
 
 // itk-wasm fetches its WASM pipelines relative to this URL at runtime; point it at the
 // vendored copy instead of the jsDelivr CDN default.
@@ -102,42 +103,41 @@ export async function zipImages(images, exportSeg, exportProb, progressCallback)
             const data = await img.backend.downloadStats()
 
             /**
-             * struct DenseMetrics {
-             *     label: u32,
-             *     area: u32,
-             *     total_intensity: u32,
-             *     sum_x: u32,
-             *     sum_y: u32,
-             *     min_intensity: u32,
-             *     max_intensity: u32
-             * };
+             * Dense stats struct (see STATS_LAYOUT). The summed fields are 64-bit,
+             * split into two u32 words; reassemble as hi*2^32 + lo:
+             *   [label, area, total_lo, total_hi, sumx_lo, sumx_hi,
+             *    sumy_lo, sumy_hi, min_intensity, max_intensity]
              */
-
-            const statsStructCount = 7;
+            const statsStructCount = STATS_LAYOUT.denseCount;
             const numLabels = data.length / statsStructCount
             console.log("unique vs numLabels", new Set(labels).size, numLabels)
 
-            for (let i = 0; i < 10 * statsStructCount; i += statsStructCount) {
+            // Intensities are stored as fixed-point integers (raw * scale). Divide by
+            // scale to recover real units (0–65535 for uint16, scale 1).
+            const scale = img.range?.scale ?? 1;
+            const u64 = (lo, hi) => hi * 2 ** 32 + lo;
+
+            for (let i = 0; i < numLabels * statsStructCount; i += statsStructCount) {
                 const label = data[i + 0]
                 const area = data[i + 1];
 
                 if (area === 0) continue; // Label not present
 
-                const totalIntensity = data[i + 2];
-                const sumX = data[i + 3];
-                const sumY = data[i + 4];
-                const minIntensityRaw = data[i + 5];
-                const maxIntensityRaw = data[i + 6];
+                const totalIntensity = u64(data[i + 2], data[i + 3]);
+                const sumX = u64(data[i + 4], data[i + 5]);
+                const sumY = u64(data[i + 6], data[i + 7]);
+                const minIntensityRaw = data[i + 8];
+                const maxIntensityRaw = data[i + 9];
 
                 // Compute the averages
                 const centroidX = sumX / area;
                 const centroidY = sumY / area;
                 const avgIntensityRaw = totalIntensity / area;
 
-                // If you scaled by 10000.0 in WGSL, scale back down:
-                const minIntensity = minIntensityRaw / 10000.0;
-                const maxIntensity = maxIntensityRaw / 10000.0;
-                const avgIntensity = avgIntensityRaw / 10000.0;
+                // Descale fixed-point intensities back to real units.
+                const minIntensity = minIntensityRaw / scale;
+                const maxIntensity = maxIntensityRaw / scale;
+                const avgIntensity = avgIntensityRaw / scale;
 
                 console.log(`Label ${label}: Centroid(${centroidX.toFixed(2)}, ${centroidY.toFixed(2)}), Intensity[Min: ${minIntensity}, Max: ${maxIntensity}, Avg: ${avgIntensity.toFixed(2)}]`);
             }

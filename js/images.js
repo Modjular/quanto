@@ -1,4 +1,4 @@
-import { LABEL_COLORS, RF_CONFIG, CONTRAST_DEFAULT } from './config.js';
+import { LABEL_COLORS, RF_CONFIG } from './config.js';
 import { WebGpuBackend } from './backends/webgpu.js';
 import { WebGl2Backend } from './backends/webgl2.js';
 import { loadFileIntoArray } from './io.js';
@@ -98,7 +98,7 @@ export async function addImage(state, file) {
       return;
     }
 
-    const { intensityArray, rgba, w, h } = loaded;
+    const { intensityArray, w, h, range } = loaded;
 
     const container = document.createElement('div');
     container.className = 'image-container';
@@ -133,7 +133,7 @@ export async function addImage(state, file) {
         syncUI(state);
         return;
     }
-    await backend.allocateImage(w, h, rgba);
+    await backend.allocateImage(w, h, intensityArray, range);
     await backend.updateFeatures(intensityArray, state.sigma);
 
     const imgState = {
@@ -143,8 +143,12 @@ export async function addImage(state, file) {
         backend,
         width: w, height: h,
         intensityArray,
-        windowLo: CONTRAST_DEFAULT.lo,
-        windowHi: CONTRAST_DEFAULT.hi,
+        range,
+        // Contrast window (black/white points) in the image's raw intensity units.
+        // Defaults to the data's min/max, reproducing the previous auto-stretch look;
+        // allocateImage seeds the backend with the same values.
+        windowLo: range.dataMin,
+        windowHi: range.dataMax,
         labels: [],
         gpuCanvas, labelCanvas, container,
         _cachedRect: null,

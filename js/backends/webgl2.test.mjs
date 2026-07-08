@@ -102,28 +102,64 @@ function checkMinIndexLabeling(labels, name) {
     for (let i = 0; i < w * h; i++) intensity[i] = i * 10;
 
     const stats = accumulateStats(labels, intensity, w, h);
-    const SC = 7;
+    const SC = 10; // dense struct: label, area, total{lo,hi}, sumx{lo,hi}, sumy{lo,hi}, min, max
     assert(stats.length === 3 * SC, `blobs: stats has 3 dense structs (got ${stats.length / SC})`);
 
+    // Reassemble the 64-bit {lo,hi} fields into a plain object for readability.
+    const u64 = (lo, hi) => hi * 2 ** 32 + lo;
     const byLabel = new Map();
-    for (let s = 0; s < stats.length; s += SC) byLabel.set(stats[s], stats.slice(s, s + SC));
+    for (let s = 0; s < stats.length; s += SC) {
+        byLabel.set(stats[s], {
+            label: stats[s], area: stats[s + 1],
+            total: u64(stats[s + 2], stats[s + 3]),
+            sumX:  u64(stats[s + 4], stats[s + 5]),
+            sumY:  u64(stats[s + 6], stats[s + 7]),
+            min:   stats[s + 8], max: stats[s + 9],
+        });
+    }
 
     // 2x2 blob at (0,0)-(1,1): label 1, area 4, pixels 0,1,5,6
-    let [label, area, total, sumX, sumY, min, max] = byLabel.get(1);
-    assert(area === 4, `blob1: area 4 (got ${area})`);
-    assert(total === (0 + 1 + 5 + 6) * 10, `blob1: total intensity (got ${total})`);
-    assert(sumX === 0 + 1 + 0 + 1 && sumY === 0 + 0 + 1 + 1, `blob1: centroid sums (got ${sumX},${sumY})`);
-    assert(min === 0 && max === 60, `blob1: min/max intensity (got ${min},${max})`);
+    let r = byLabel.get(1);
+    assert(r.area === 4, `blob1: area 4 (got ${r.area})`);
+    assert(r.total === (0 + 1 + 5 + 6) * 10, `blob1: total intensity (got ${r.total})`);
+    assert(r.sumX === 0 + 1 + 0 + 1 && r.sumY === 0 + 0 + 1 + 1, `blob1: centroid sums (got ${r.sumX},${r.sumY})`);
+    assert(r.min === 0 && r.max === 60, `blob1: min/max intensity (got ${r.min},${r.max})`);
 
     // 1x2 vertical bar at x=4: label 5 (min index 4), area 2, pixels 4,9
-    [label, area, total, sumX, sumY, min, max] = byLabel.get(5);
-    assert(area === 2, `blob2: area 2 (got ${area})`);
-    assert(total === (4 + 9) * 10, `blob2: total intensity (got ${total})`);
+    r = byLabel.get(5);
+    assert(r.area === 2, `blob2: area 2 (got ${r.area})`);
+    assert(r.total === (4 + 9) * 10, `blob2: total intensity (got ${r.total})`);
 
     // 2x1 bar at row 3, x=2..3: pixels 17,18 -> label 18
-    [label, area, total, sumX, sumY, min, max] = byLabel.get(18);
-    assert(area === 2, `blob3: area 2 (got ${area})`);
-    assert(sumX === 2 + 3 && sumY === 3 + 3, `blob3: centroid sums (got ${sumX},${sumY})`);
+    r = byLabel.get(18);
+    assert(r.area === 2, `blob3: area 2 (got ${r.area})`);
+    assert(r.sumX === 2 + 3 && r.sumY === 3 + 3, `blob3: centroid sums (got ${r.sumX},${r.sumY})`);
+}
+
+// ---- Test 4b: 64-bit accumulation — total intensity sum exceeds 2^32 ----
+{
+    // One solid component whose intensity sum overflows a u32. Each pixel holds
+    // 65535 (raw uint16 max); enough pixels push the sum past 2^32, which the
+    // {lo,hi} split must carry correctly.
+    const w = 200, h = 400; // 80,000 pixels
+    const mask = new Uint8Array(w * h).fill(1);
+    const labels = cclLabel(mask, w, h);
+
+    const V = 65535;
+    const intensity = new Float64Array(w * h).fill(V);
+    const expectedTotal = w * h * V; // 80000 * 65535 = 5,242,800,000 > 2^32 (4,294,967,296)
+    assert(expectedTotal > 2 ** 32, `overflow: expected total ${expectedTotal} exceeds 2^32`);
+
+    const stats = accumulateStats(labels, intensity, w, h);
+    const SC = 10;
+    assert(stats.length === SC, `overflow: single component (got ${stats.length / SC})`);
+
+    const area = stats[1];
+    const total = stats[3] * 2 ** 32 + stats[2]; // hi*2^32 + lo
+    assert(area === w * h, `overflow: area ${w * h} (got ${area})`);
+    assert(stats[3] > 0, `overflow: high word is set (got ${stats[3]})`);
+    assert(total === expectedTotal, `overflow: reassembled total matches (got ${total}, want ${expectedTotal})`);
+    assert(stats[9] === V, `overflow: max intensity is ${V} in raw units (got ${stats[9]})`);
 }
 
 // ---- Test 5: empty mask ----

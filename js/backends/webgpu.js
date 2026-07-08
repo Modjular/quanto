@@ -15,6 +15,8 @@
  * them; a render pass composites the argmax overlay. Data is only read back to
  * the CPU on demand through the download* methods.
  */
+import { STATS_LAYOUT } from '../config.js';
+
 export class WebGpuBackend {
     constructor(labelColors) {
         this.device = null;
@@ -22,12 +24,26 @@ export class WebGpuBackend {
         this.format = null;
         this.width = 0;
         this.height = 0;
-        this.originalTexture = null;
+        // Raw single-channel intensity (r32float), shared by the stats pass and the
+        // display window/level in the composite pass. Holds real pixel magnitudes.
+        this.rawIntensityTexture = null;
+        // Fixed-point multiplier applied to raw intensity before integer accumulation
+        // in computeStats (1 for integer dtypes, larger for float). Set per image.
+        this.intensityScale = 1;
         this.featureBuffer = null;
         this.probBuffer = null;
         this.labelBuffer = null;
         this.statsBuffer = null;
         this.statsCounterBuffer = null;
+        // Uniform holding the per-call label count for the stats passes (see computeStats).
+        this.statsParamsBuffer = null;
+
+        // Composite render pipeline + its window uniform buffer, built once per
+        // allocateImage (width/height/colors are fixed for the image's lifetime).
+        // setWindow only writes into windowBuffer and re-records the draw — no
+        // shader recompile / pipeline rebuild on the drag hot path.
+        this.compositePipeline = null;
+        this.windowBuffer = null;
 
         this.labelColors = labelColors || [
             'rgba(255,0,0,1.0)',
@@ -35,10 +51,18 @@ export class WebGpuBackend {
             'rgba(0,0,255,1.0)',
         ];
 
-        // Display-only contrast window (black/white points) in normalized [0,1]
-        // space. Identity by default; see setWindow.
+        // Display-only contrast window (black/white points) in the image's raw
+        // intensity units. Seeded to the data range in allocateImage; see setWindow.
         this.windowLo = 0.0;
         this.windowHi = 1.0;
+
+        // Compiled compute pipelines keyed by a stable per-pass id. Every compute
+        // pass bakes only image-lifetime constants (width/height/label-count/scale)
+        // into its WGSL — the per-call label count for the stats passes is passed as
+        // a uniform instead — so each pass compiles once and is reused across every
+        // retrain rather than rebuilt per call. Cleared in allocateImage, where
+        // those baked constants can change. A pass opts out by omitting a cacheKey.
+        this._pipelineCache = new Map();
     }
 
     /**
@@ -69,12 +93,20 @@ export class WebGpuBackend {
      * or each call can use its own encoder + submit if passes must be sequenced
      * around a CPU readback in between.
      */
-    _addComputePass(encoder, { code, entryPoint, bindings, dispatchX, dispatchY = 1, dispatchZ = 1 }) {
-        const module = this.device.createShaderModule({ code });
-        const pipeline = this.device.createComputePipeline({
-            layout: 'auto',
-            compute: { module, entryPoint }
-        });
+    _addComputePass(encoder, { code, entryPoint, bindings, dispatchX, dispatchY = 1, dispatchZ = 1, cacheKey = null }) {
+        // Compiling the module + building the pipeline is the expensive part; the
+        // bind group (which references the actual buffers, and so must be rebuilt
+        // each call) is cheap. When the caller supplies a cacheKey — meaning this
+        // pass's WGSL is stable for the image's lifetime — reuse the pipeline.
+        let pipeline = cacheKey !== null ? this._pipelineCache.get(cacheKey) : null;
+        if (!pipeline) {
+            const module = this.device.createShaderModule({ code });
+            pipeline = this.device.createComputePipeline({
+                layout: 'auto',
+                compute: { module, entryPoint }
+            });
+            if (cacheKey !== null) this._pipelineCache.set(cacheKey, pipeline);
+        }
         const bindGroup = this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: bindings
@@ -110,25 +142,36 @@ export class WebGpuBackend {
     }
 
     /**
-     * (Re)allocates the per-image GPU resources (original texture, probability
+     * (Re)allocates the per-image GPU resources (raw intensity texture, probability
      * and label buffers), freeing any previous ones, and seeds probabilities to
      * -1 (the "unclassified" sentinel). Feature/stats buffers are cleared and
-     * rebuilt lazily on the next updateFeatures/computeStats.
+     * rebuilt lazily on the next updateFeatures/computeStats. Also seeds the
+     * contrast window and stats fixed-point scale from the image's range metadata.
      * @param {number} width
      * @param {number} height
-     * @param {Uint8Array|Uint8ClampedArray} rgbaData - Source RGBA pixels.
+     * @param {Float32Array} intensityArray - Raw single-channel intensities.
+     * @param {{dataMin: number, dataMax: number, dtypeMax: number, scale: number}} range
      */
-    async allocateImage(width, height, rgbaData) {
+    async allocateImage(width, height, intensityArray, range) {
         this.width = width;
         this.height = height;
+        this.intensityScale = range.scale;
+        // Cached compute pipelines bake in the (about to change) width/height/label
+        // count, so drop them; they recompile lazily on next use.
+        this._pipelineCache.clear();
+        // Default the display window to the data range → reproduces the auto-stretch look.
+        this.windowLo = range.dataMin;
+        this.windowHi = range.dataMax;
 
-        if (this.originalTexture) this.originalTexture.destroy();
-        this.originalTexture = this.device.createTexture({
+        if (this.rawIntensityTexture) this.rawIntensityTexture.destroy();
+        this.rawIntensityTexture = this.device.createTexture({
             size: [width, height],
-            format: 'rgba8unorm',
+            format: 'r32float',
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
         });
-        this.device.queue.writeTexture({ texture: this.originalTexture }, rgbaData, { bytesPerRow: width * 4 }, [width, height]);
+        // 4 bytes per r32float texel. textureLoad (no filtering) reads it in both the
+        // stats compute pass and the composite fragment shader.
+        this.device.queue.writeTexture({ texture: this.rawIntensityTexture }, intensityArray, { bytesPerRow: width * 4 }, [width, height]);
 
         const numColors = this.labelColors.length;
         if (this.probBuffer) this.probBuffer.destroy();
@@ -150,6 +193,53 @@ export class WebGpuBackend {
         if (this.featureBuffer) { this.featureBuffer.destroy(); this.featureBuffer = null; }
         if (this.statsBuffer) { this.statsBuffer.destroy(); this.statsBuffer = null; }
         if (this.statsCounterBuffer) { this.statsCounterBuffer.destroy(); this.statsCounterBuffer = null; }
+
+        // Uniform for the stats passes' label count (Params{max_labels:u32}); padded
+        // to 16 bytes to satisfy uniform-buffer sizing. computeStats writes it per call.
+        if (!this.statsParamsBuffer) {
+            this.statsParamsBuffer = this.device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+        }
+
+        this._buildCompositePipeline();
+        // Seed the window uniform to match the windowLo/windowHi set above.
+        this.device.queue.writeBuffer(this.windowBuffer, 0, new Float32Array([this.windowLo, this.windowHi]));
+    }
+
+    /**
+     * Compiles the composite render pipeline for the current width/height/label
+     * colors and (re)allocates its window uniform buffer. Called once per
+     * allocateImage — NOT per frame — since shader compilation and pipeline
+     * creation are too expensive to repeat while the user drags the contrast
+     * slider (see setWindow/renderComposite, which only touch the uniform buffer
+     * and bind group after this has run).
+     */
+    _buildCompositePipeline() {
+        const colors = this.labelColors;
+        const colorsWGSL = colors.map(parseColorToWGSL).join(',\n            ');
+
+        const code = COMPOSITE_SHADER
+            .replace(/{{WIDTH}}/g, this.width)
+            .replace(/{{HEIGHT}}/g, this.height)
+            .replace(/{{NUM_COLORS}}/g, colors.length)
+            .replace(/{{COLORS_ARRAY}}/g, colorsWGSL);
+
+        const module = this.device.createShaderModule({ code });
+        this.compositePipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module, entryPoint: 'vs_main' },
+            fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+            primitive: { topology: 'triangle-strip' }
+        });
+
+        if (this.windowBuffer) this.windowBuffer.destroy();
+        // Window { lo: f32, hi: f32 } — 8 bytes, updated via writeBuffer in setWindow.
+        this.windowBuffer = this.device.createBuffer({
+            size: 8,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
     }
 
     /**
@@ -181,6 +271,10 @@ export class WebGpuBackend {
 
         const enc = this.device.createCommandEncoder();
 
+        // Keyed by class + threshold since those are baked into baseCode (dispatched
+        // per class every retrain, so a bounded handful of distinct pipelines).
+        const cclKey = `${targetClassIdx}:${threshold.toFixed(4)}`;
+
         // Pass 1: Initialize values based on raw inference thresholds
         this._addComputePass(enc, {
             code: baseCode,
@@ -189,7 +283,8 @@ export class WebGpuBackend {
                 { binding: 0, resource: { buffer: this.probBuffer } },
                 { binding: 1, resource: { buffer: this.labelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: `ccl-init:${cclKey}`
         });
 
         // Pass 2: Neighborhood boundary checking and equivalence linking
@@ -199,7 +294,8 @@ export class WebGpuBackend {
             bindings: [
                 { binding: 1, resource: { buffer: this.labelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: `ccl-merge:${cclKey}`
         });
 
         // Pass 3: Path relaxation (Tree flattening) to find absolute roots
@@ -209,7 +305,8 @@ export class WebGpuBackend {
             bindings: [
                 { binding: 1, resource: { buffer: this.labelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: `ccl-flatten:${cclKey}`
         });
 
         this.device.queue.submit([enc.finish()]);
@@ -245,11 +342,17 @@ export class WebGpuBackend {
                 { binding: 0, resource: { buffer: this.labelBuffer } },
                 { binding: 1, resource: { buffer: maxLabelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'findmax'
         });
         this.device.queue.submit([maxEncoder.finish()]);
 
         // --- CPU/GPU SYNC POINT: Halt and wait for the max label ---
+        // DEFERRED PERF (#2): this readback stalls the pipeline once per class per
+        // image, just to size the stats buffer. It could be avoided by allocating
+        // the stats buffers to a worst-case bound (e.g. width*height labels) and
+        // skipping the round-trip — a memory-for-latency trade left until a profiler
+        // says it matters.
         const maxLabelArray = await this._readBuffer(maxLabelBuffer, 4, Uint32Array);
         const maxLabel = maxLabelArray[0];
         maxLabelBuffer.destroy();
@@ -260,11 +363,16 @@ export class WebGpuBackend {
         // Labels are 0-indexed, so the required size is maxLabel + 1
         const maxExpectedLabels = maxLabel + 1;
 
+        // Feed the label count to the accumulate/compact passes as a uniform (rather
+        // than baking it into their WGSL) so those pipelines stay cacheable even as
+        // the segmentation — and thus maxExpectedLabels — changes call to call.
+        this.device.queue.writeBuffer(this.statsParamsBuffer, 0, new Uint32Array([maxExpectedLabels]));
+
         // =========================================================
         // PASS 2: Accumulate Statistics
         // =========================================================
 
-        const statsStructCount = 6;
+        const statsStructCount = STATS_LAYOUT.sparseCount;
         const statsSize = maxExpectedLabels * statsStructCount * 4;
 
         if (this.statsBuffer) this.statsBuffer.destroy();
@@ -275,14 +383,16 @@ export class WebGpuBackend {
 
         const initData = new Uint32Array(maxExpectedLabels * statsStructCount);
         for (let i = 0; i < maxExpectedLabels; i++) {
-            initData[i * statsStructCount + 4] = 0xFFFFFFFF; // Set min_intensity to max u32
+            initData[i * statsStructCount + STATS_LAYOUT.minIndex] = 0xFFFFFFFF; // min_intensity seeded to max u32
         }
         this.device.queue.writeBuffer(this.statsBuffer, 0, initData);
 
         const statsCode = STATS_ACCUMULATOR_SHADER
             .replace(/{{WIDTH}}/g, this.width)
             .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels);
+            // Raw intensity → fixed-point integer; 1.0 for integer dtypes (exact).
+            // Baked (image-constant), unlike max_labels which is a uniform.
+            .replace(/{{SCALE}}/g, this.intensityScale.toFixed(6));
 
         const statsEncoder = this.device.createCommandEncoder();
         this._addComputePass(statsEncoder, {
@@ -290,10 +400,12 @@ export class WebGpuBackend {
             entryPoint: 'main',
             bindings: [
                 { binding: 0, resource: { buffer: this.labelBuffer } },
-                { binding: 1, resource: this.originalTexture.createView() },
-                { binding: 2, resource: { buffer: this.statsBuffer } }
+                { binding: 1, resource: this.rawIntensityTexture.createView() },
+                { binding: 2, resource: { buffer: this.statsBuffer } },
+                { binding: 3, resource: { buffer: this.statsParamsBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'stats-accumulate'
         });
         this.device.queue.submit([statsEncoder.finish()]);
 
@@ -307,7 +419,7 @@ export class WebGpuBackend {
         });
         this.device.queue.writeBuffer(counterBuffer, 0, new Uint32Array([0]));
 
-        const denseStructCount = 7;
+        const denseStructCount = STATS_LAYOUT.denseCount;
         const maxDenseSize = maxExpectedLabels * denseStructCount * 4;
         const compactStatsBuffer = this.device.createBuffer({
             size: maxDenseSize,
@@ -316,8 +428,7 @@ export class WebGpuBackend {
 
         const compactCode = COMPACT_STATS_SHADER
             .replace(/{{WIDTH}}/g, this.width)
-            .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels);
+            .replace(/{{HEIGHT}}/g, this.height);
 
         const compactEncoder = this.device.createCommandEncoder();
         this._addComputePass(compactEncoder, {
@@ -326,9 +437,11 @@ export class WebGpuBackend {
             bindings: [
                 { binding: 0, resource: { buffer: this.statsBuffer } },   // The sparse buffer
                 { binding: 1, resource: { buffer: compactStatsBuffer } }, // The dense buffer
-                { binding: 2, resource: { buffer: counterBuffer } }       // The atomic counter
+                { binding: 2, resource: { buffer: counterBuffer } },      // The atomic counter
+                { binding: 3, resource: { buffer: this.statsParamsBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'stats-compact'
         });
         this.device.queue.submit([compactEncoder.finish()]);
 
@@ -339,9 +452,10 @@ export class WebGpuBackend {
     }
 
     /**
-     * Reads back the compacted per-object stats from the last computeStats call
-     * as dense 7-field structs (label, area, total_intensity, sum_x, sum_y, min,
-     * max). Empty if no objects were found.
+     * Reads back the compacted per-object stats from the last computeStats call as
+     * dense structs (see STATS_LAYOUT): label, area, total_intensity {lo,hi},
+     * sum_x {lo,hi}, sum_y {lo,hi}, min, max. The summed fields are 64-bit, split
+     * across two u32 words — reassemble as hi*2^32 + lo. Empty if no objects found.
      * @returns {Promise<Uint32Array>}
      */
     async downloadStats() {
@@ -351,8 +465,7 @@ export class WebGpuBackend {
         // If no objects were found, bail early!
         if (numObjects === 0) return new Uint32Array(0);
 
-        const denseStructCount = 7; // label, area, total_intensity, sum_x, sum_y, min, max
-        const bytesToCopy = numObjects * denseStructCount * 4;
+        const bytesToCopy = numObjects * STATS_LAYOUT.denseCount * 4;
 
         return this._readBuffer(this.statsBuffer, bytesToCopy, Uint32Array);
     }
@@ -416,6 +529,10 @@ export class WebGpuBackend {
             this.device.queue.writeBuffer(gpuInput, 0, data);
         }
 
+        // DEFERRED PERF (#3): these scratch buffers (and the per-call stats/counter
+        // buffers in computeStats) are created and destroyed every call. Allocation
+        // is far cheaper than the pipeline compilation now cached above, so a
+        // size-keyed buffer pool is left until profiling points here.
         const gpuHoriz = this.device.createBuffer({ size: this.width * this.height * 4 * 4, usage: GPUBufferUsage.STORAGE });
         const gpuOutput = this.device.createBuffer({ size: outSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
 
@@ -525,7 +642,8 @@ export class WebGpuBackend {
                 { binding: 1, resource: { buffer: gpuHoriz } },
                 { binding: 2, resource: { buffer: kernelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'feat-horiz'
         });
 
         this._addComputePass(enc, {
@@ -536,7 +654,8 @@ export class WebGpuBackend {
                 { binding: 1, resource: { buffer: gpuOutput } },
                 { binding: 2, resource: { buffer: kernelBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'feat-vert'
         });
 
         this.device.queue.submit([enc.finish()]);
@@ -588,6 +707,7 @@ export class WebGpuBackend {
         this._addComputePass(enc, {
             code: GATHER_FEATURES_SHADER,
             entryPoint: 'main',
+            cacheKey: 'gather',
             bindings: [
                 { binding: 0, resource: { buffer: this.featureBuffer } },
                 { binding: 1, resource: { buffer: indicesBuffer } },
@@ -670,6 +790,7 @@ export class WebGpuBackend {
         this._addComputePass(enc, {
             code,
             entryPoint: 'main',
+            cacheKey: 'inference',
             bindings: [
                 { binding: 0, resource: { buffer: this.featureBuffer } },
                 { binding: 1, resource: { buffer: forestBuffer } },
@@ -687,36 +808,24 @@ export class WebGpuBackend {
         this.renderComposite();
     }
 
-    /** Paints the canvas: the original image with the argmax class overlaid where classified. */
+    /**
+     * Paints the canvas: the original image with the argmax class overlaid where
+     * classified. Reuses the pipeline built by _buildCompositePipeline (in
+     * allocateImage) — only the bind group is rebuilt here, since probBuffer is
+     * destroyed/recreated by runInference and must be re-bound each time it
+     * changes. Bind-group creation is cheap (no shader work), so this is safe to
+     * call every frame, including on every contrast-slider tick.
+     */
     renderComposite() {
-        if (!this.originalTexture || !this.probBuffer) return;
-
-        const colors = this.labelColors;
-        const colorsWGSL = colors.map(parseColorToWGSL).join(',\n            ');
-
-        const code = COMPOSITE_SHADER
-            .replace(/{{WIDTH}}/g, this.width)
-            .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{NUM_COLORS}}/g, colors.length)
-            .replace(/{{COLORS_ARRAY}}/g, colorsWGSL)
-            // Formatted with a decimal point so they parse as WGSL f32 literals.
-            .replace(/{{WIN_LO}}/g, this.windowLo.toFixed(6))
-            .replace(/{{WIN_HI}}/g, this.windowHi.toFixed(6));
-
-        const module = this.device.createShaderModule({ code });
-        const pipeline = this.device.createRenderPipeline({
-            layout: 'auto',
-            vertex: { module, entryPoint: 'vs_main' },
-            fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
-            primitive: { topology: 'triangle-strip' }
-        });
+        if (!this.rawIntensityTexture || !this.probBuffer || !this.compositePipeline) return;
 
         const bindGroup = this.device.createBindGroup({
-            layout: pipeline.getBindGroupLayout(0),
+            layout: this.compositePipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this.device.createSampler() },
-                { binding: 1, resource: this.originalTexture.createView() },
-                { binding: 2, resource: { buffer: this.probBuffer } }
+                // r32float is unfilterable, so the composite uses textureLoad (no sampler).
+                { binding: 0, resource: this.rawIntensityTexture.createView() },
+                { binding: 1, resource: { buffer: this.probBuffer } },
+                { binding: 2, resource: { buffer: this.windowBuffer } }
             ]
         });
 
@@ -728,7 +837,7 @@ export class WebGpuBackend {
                 loadOp: 'clear', storeOp: 'store'
             }]
         });
-        pass.setPipeline(pipeline);
+        pass.setPipeline(this.compositePipeline);
         pass.setBindGroup(0, bindGroup);
         pass.draw(4);
         pass.end();
@@ -737,8 +846,10 @@ export class WebGpuBackend {
 
     /**
      * Sets the display-only contrast window (black point `lo`, white point `hi`,
-     * both in normalized [0,1] display space) and repaints. This only affects the
-     * composite pass — it does not touch the intensity data fed to feature
+     * in the image's raw intensity units) and repaints. This only writes 8 bytes
+     * into the window uniform buffer and re-records the draw with the existing
+     * pipeline — no shader recompile, so it's cheap enough to call on every
+     * slider-drag tick. Does not touch the intensity data fed to feature
      * extraction, so classification is unchanged and no retrain is triggered.
      * @param {number} lo - Black point; pixels <= lo render black.
      * @param {number} hi - White point; pixels >= hi render white.
@@ -746,6 +857,7 @@ export class WebGpuBackend {
     setWindow(lo, hi) {
         this.windowLo = lo;
         this.windowHi = hi;
+        this.device.queue.writeBuffer(this.windowBuffer, 0, new Float32Array([lo, hi]));
         this.renderComposite();
     }
 
@@ -762,12 +874,17 @@ export class WebGpuBackend {
 
     /** Frees all GPU textures and buffers held by this backend. */
     destroy() {
-        if (this.originalTexture)    { this.originalTexture.destroy();    this.originalTexture = null; }
+        if (this.rawIntensityTexture) { this.rawIntensityTexture.destroy(); this.rawIntensityTexture = null; }
         if (this.featureBuffer)      { this.featureBuffer.destroy();      this.featureBuffer = null; }
         if (this.probBuffer)         { this.probBuffer.destroy();         this.probBuffer = null; }
         if (this.labelBuffer)        { this.labelBuffer.destroy();        this.labelBuffer = null; }
         if (this.statsBuffer)        { this.statsBuffer.destroy();        this.statsBuffer = null; }
         if (this.statsCounterBuffer) { this.statsCounterBuffer.destroy(); this.statsCounterBuffer = null; }
+        if (this.statsParamsBuffer)  { this.statsParamsBuffer.destroy();  this.statsParamsBuffer = null; }
+        if (this.windowBuffer)       { this.windowBuffer.destroy();       this.windowBuffer = null; }
+        // Pipelines have no destroy(); drop references so they can be GC'd.
+        this.compositePipeline = null;
+        this._pipelineCache.clear();
     }
 }
 
@@ -966,19 +1083,26 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-@group(0) @binding(0) var s: sampler;
-@group(0) @binding(1) var t_raw: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read> p_map: array<f32>;
+struct Window { lo: f32, hi: f32 };
+
+@group(0) @binding(0) var t_raw: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read> p_map: array<f32>;
+// Contrast window as a uniform (not a shader-text constant) so dragging the slider
+// only needs a cheap queue.writeBuffer, not a shader recompile + new pipeline.
+@group(0) @binding(2) var<uniform> win: Window;
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    var raw = textureSample(t_raw, s, uv);
-    // Display-only contrast window: remap [lo,hi] -> [0,1]. Identity at lo=0,hi=1.
-    raw = vec4(clamp((raw.rgb - {{WIN_LO}}) / max({{WIN_HI}} - {{WIN_LO}}, 1e-4), vec3(0.0), vec3(1.0)), raw.a);
     let w = u32({{WIDTH}});
     let h = u32({{HEIGHT}});
     let x = u32(uv.x * f32(w));
     let y = u32(uv.y * f32(h));
+
+    // Read the raw intensity (r32float, unfilterable → textureLoad) and apply the
+    // display-only contrast window [lo,hi] -> [0,1] in raw units, broadcast to gray.
+    let raw_val = textureLoad(t_raw, vec2<i32>(i32(x), i32(y)), 0).r;
+    let v = clamp((raw_val - win.lo) / max(win.hi - win.lo, 1e-4), 0.0, 1.0);
+    let raw = vec4<f32>(v, v, v, 1.0);
 
     let base_idx = clamp(y * w + x, 0u, w * h - 1u) * {{NUM_COLORS}}u;
     var max_p: f32 = -1.0;
@@ -1142,18 +1266,35 @@ fn main(
 * High-Speed Topology Statistics Accumulator
 */
 const STATS_ACCUMULATOR_SHADER = `
+// Summed fields are 64-bit, split into {lo, hi} u32 words. WGSL has no atomic<u64>,
+// so add64 emulates it: add into the low word, and on wrap carry 1 into the high
+// word. Exact and deterministic (integer add is associative). See STATS_LAYOUT.
+// The lo/hi pair is grouped into a U64 struct so add64 takes a single pointer —
+// WGSL forbids passing two pointers into the same buffer to one function (they'd
+// be treated as aliasing). Layout is identical to nine consecutive u32.
+struct U64 { lo: atomic<u32>, hi: atomic<u32> };
 struct Metrics {
     area: atomic<u32>,
-    total_intensity: atomic<u32>,
-    sum_x: atomic<u32>,
-    sum_y: atomic<u32>,
+    total: U64,
+    sum_x: U64,
+    sum_y: U64,
     min_intensity: atomic<u32>,
     max_intensity: atomic<u32>
 };
+// max_labels is a uniform (not baked into the source) so this shader's text is
+// constant for the image's lifetime and its pipeline can be cached across the
+// many computeStats calls per retrain, even though the label count changes.
+struct Params { max_labels: u32 };
 
 @group(0) @binding(0) var<storage, read> labels: array<u32>;
 @group(0) @binding(1) var raw_intensity: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> stats: array<Metrics>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn add64(acc: ptr<storage, U64, read_write>, v: u32) {
+    let old = atomicAdd(&(*acc).lo, v);
+    if (old > 0xffffffffu - v) { atomicAdd(&(*acc).hi, 1u); } // low word wrapped -> carry
+}
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1163,32 +1304,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel_idx = id.y * w + id.x;
     let label = labels[pixel_idx];
 
-    if (label == 0u || label >= {{MAX_LABELS}}u) { return; }
+    if (label == 0u || label >= params.max_labels) { return; }
 
-    // Read directly from the texture using the X/Y coordinates
-    let color = textureLoad(raw_intensity, vec2<i32>(id.xy), 0);
-    let intensity_f = color.r; // Grab the red channel for intensity
-    // Scale standard normalized float values to fixed-point integer spaces
-    let intensity_u = u32(intensity_f * 10000.0);
+    // Read the raw intensity (red channel) and convert to fixed-point integer.
+    // SCALE is 1.0 for integer dtypes (exact) — see intensityScale in computeStats.
+    let intensity_f = textureLoad(raw_intensity, vec2<i32>(id.xy), 0).r;
+    let intensity_u = u32(intensity_f * {{SCALE}});
 
-    // Accumulate sums
+    // Accumulate: area fits u32 (pixel count); the growing sums use 64-bit add64.
     atomicAdd(&stats[label].area, 1u);
-    atomicAdd(&stats[label].total_intensity, intensity_u);
-    atomicAdd(&stats[label].sum_x, id.x);
-    atomicAdd(&stats[label].sum_y, id.y);
+    add64(&stats[label].total, intensity_u);
+    add64(&stats[label].sum_x, id.x);
+    add64(&stats[label].sum_y, id.y);
 
-    // Evaluate Min/Max
+    // Min/Max don't sum, so a single u32 holds the raw fixed-point value.
     atomicMin(&stats[label].min_intensity, intensity_u);
     atomicMax(&stats[label].max_intensity, intensity_u);
 }
 `;
 
 const COMPACT_STATS_SHADER = `
+// Field layout mirrors STATS_LAYOUT. The 64-bit sums keep their {lo, hi} split in
+// the dense output; the JS side reassembles them as hi*2^32 + lo.
 struct SparseMetrics {
     area: atomic<u32>,
-    total_intensity: atomic<u32>,
-    sum_x: atomic<u32>,
-    sum_y: atomic<u32>,
+    total_lo: atomic<u32>, total_hi: atomic<u32>,
+    sum_x_lo: atomic<u32>, sum_x_hi: atomic<u32>,
+    sum_y_lo: atomic<u32>, sum_y_hi: atomic<u32>,
     min_intensity: atomic<u32>,
     max_intensity: atomic<u32>
 };
@@ -1196,16 +1338,20 @@ struct SparseMetrics {
 struct DenseMetrics {
     label: u32,
     area: u32,
-    total_intensity: u32,
-    sum_x: u32,
-    sum_y: u32,
+    total_lo: u32, total_hi: u32,
+    sum_x_lo: u32, sum_x_hi: u32,
+    sum_y_lo: u32, sum_y_hi: u32,
     min_intensity: u32,
     max_intensity: u32
 };
 
+// max_labels is a uniform (see STATS_ACCUMULATOR_SHADER) so this pipeline caches.
+struct Params { max_labels: u32 };
+
 @group(0) @binding(0) var<storage, read_write> sparse_stats: array<SparseMetrics>;
 @group(0) @binding(1) var<storage, read_write> compact_stats: array<DenseMetrics>;
 @group(0) @binding(2) var<storage, read_write> counter: atomic<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1219,7 +1365,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let label_idx = id.y * w + id.x;
 
     // Check against the maximum expected labels found in Pass 1
-    if (label_idx >= {{MAX_LABELS}}u) { return; }
+    if (label_idx >= params.max_labels) { return; }
     if (label_idx == 0u) { return; }
 
     let area = atomicLoad(&sparse_stats[label_idx].area);
@@ -1228,9 +1374,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         compact_stats[write_idx].label = label_idx;
         compact_stats[write_idx].area = area;
-        compact_stats[write_idx].total_intensity = atomicLoad(&sparse_stats[label_idx].total_intensity);
-        compact_stats[write_idx].sum_x = atomicLoad(&sparse_stats[label_idx].sum_x);
-        compact_stats[write_idx].sum_y = atomicLoad(&sparse_stats[label_idx].sum_y);
+        compact_stats[write_idx].total_lo = atomicLoad(&sparse_stats[label_idx].total_lo);
+        compact_stats[write_idx].total_hi = atomicLoad(&sparse_stats[label_idx].total_hi);
+        compact_stats[write_idx].sum_x_lo = atomicLoad(&sparse_stats[label_idx].sum_x_lo);
+        compact_stats[write_idx].sum_x_hi = atomicLoad(&sparse_stats[label_idx].sum_x_hi);
+        compact_stats[write_idx].sum_y_lo = atomicLoad(&sparse_stats[label_idx].sum_y_lo);
+        compact_stats[write_idx].sum_y_hi = atomicLoad(&sparse_stats[label_idx].sum_y_hi);
         compact_stats[write_idx].min_intensity = atomicLoad(&sparse_stats[label_idx].min_intensity);
         compact_stats[write_idx].max_intensity = atomicLoad(&sparse_stats[label_idx].max_intensity);
     }

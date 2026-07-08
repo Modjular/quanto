@@ -16,13 +16,20 @@
  * on the CPU (see cclLabel/accumulateStats) with the same output contract as the
  * WebGPU backend.
  */
+import { STATS_LAYOUT } from '../config.js';
+
 export class WebGl2Backend {
   constructor(labelColors) {
       this.gl = null;
       this.width = 0;
       this.height = 0;
-      this.originalTexture = null;
-      
+      // Raw single-channel intensity (R32F), shared by the stats pass and the
+      // display window/level in the composite pass. Holds real pixel magnitudes.
+      this.rawIntensityTexture = null;
+      // Fixed-point multiplier applied to raw intensity before integer accumulation
+      // in computeStats (1 for integer dtypes, larger for float). Set per image.
+      this.intensityScale = 1;
+
       // FBOs and Textures
       this.horizFbo = null;
       this.horizTexture = null;
@@ -36,8 +43,8 @@ export class WebGl2Backend {
       this.labels = null;
       this.denseStats = null;
 
-      // Display-only contrast window (black/white points) in normalized [0,1]
-      // space. Identity by default; see setWindow.
+      // Display-only contrast window (black/white points) in the image's raw
+      // intensity units. Seeded to the data range in allocateImage; see setWindow.
       this.windowLo = 0.0;
       this.windowHi = 1.0;
 
@@ -75,26 +82,34 @@ export class WebGl2Backend {
   /**
    * (Re)allocates all per-image textures and framebuffers for a new image,
    * freeing any previous ones, and seeds the probability buffer to -1
-   * (the "unclassified" sentinel).
+   * (the "unclassified" sentinel). Also seeds the contrast window and stats
+   * fixed-point scale from the image's range metadata.
    * @param {number} width
    * @param {number} height
-   * @param {Uint8Array|Uint8ClampedArray} rgbaData - Source RGBA pixels.
+   * @param {Float32Array} intensityArray - Raw single-channel intensities.
+   * @param {{dataMin: number, dataMax: number, dtypeMax: number, scale: number}} range
    */
-  async allocateImage(width, height, rgbaData) {
+  async allocateImage(width, height, intensityArray, range) {
       this.width = width;
       this.height = height;
+      this.intensityScale = range.scale;
+      // Default the display window to the data range → reproduces the auto-stretch look.
+      this.windowLo = range.dataMin;
+      this.windowHi = range.dataMax;
       const gl = this.gl;
 
       // Free previous per-image resources: allocateImage is called repeatedly
       // (once per slice), so recreating without deleting leaks GPU memory.
-      [this.originalTexture, this.horizTexture, this.featTexture0,
+      [this.rawIntensityTexture, this.horizTexture, this.featTexture0,
        this.featTexture1, this.probTexture].forEach(t => { if (t) gl.deleteTexture(t); });
       [this.horizFbo, this.featFbo, this.probFbo].forEach(f => { if (f) gl.deleteFramebuffer(f); });
       this.labels = null;
       this.denseStats = null;
 
-      this.originalTexture = this._createTexture(width, height, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, rgbaData);
-      
+      // R32F holds raw intensity; sampled with NEAREST (float textures aren't
+      // linearly filterable without OES_texture_float_linear, which we don't need).
+      this.rawIntensityTexture = this._createTexture(width, height, gl.R32F, gl.RED, gl.FLOAT, intensityArray);
+
       this.horizTexture = this._createTexture(width, height, gl.RGBA32F, gl.RGBA, gl.FLOAT, null);
       this.horizFbo = this._createFbo([this.horizTexture]);
 
@@ -326,7 +341,7 @@ export class WebGl2Backend {
 
   /** Paints the canvas: the original image with the argmax class overlaid where classified. */
   renderComposite() {
-      if (!this.originalTexture) return;
+      if (!this.rawIntensityTexture) return;
       const gl = this.gl;
 
       gl.viewport(0, 0, this.width, this.height);
@@ -334,7 +349,7 @@ export class WebGl2Backend {
       gl.useProgram(this.progComposite);
       gl.bindVertexArray(this.quadVao);
 
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.originalTexture);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.rawIntensityTexture);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.probTexture);
       
       gl.uniform1i(gl.getUniformLocation(this.progComposite, "u_original"), 0);
@@ -347,7 +362,7 @@ export class WebGl2Backend {
 
   /**
    * Sets the display-only contrast window (black point `lo`, white point `hi`,
-   * both in normalized [0,1] display space) and repaints. This only affects the
+   * in the image's raw intensity units) and repaints. This only affects the
    * composite pass — it does not touch the intensity data fed to feature
    * extraction, so classification is unchanged and no retrain is triggered.
    * @param {number} lo - Black point; pixels <= lo render black.
@@ -414,26 +429,27 @@ export class WebGl2Backend {
 
   /**
    * Compiles area and cumulative intensity metric profiles per label ID.
-   * Produces the same dense 7-field structs as WebGpuBackend.computeStats.
+   * Produces the same dense structs as WebGpuBackend.computeStats (see STATS_LAYOUT).
    */
   async computeStats() {
       if (!this.labels) return null;
       const gl = this.gl;
       const n = this.width * this.height;
 
-      // Read the original image back for the red-channel intensity
+      // Read the raw intensity texture (R32F) back for the red-channel intensity.
       const fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.originalTexture, 0);
-      const rgba = new Uint8Array(n * 4);
-      gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.rawIntensityTexture, 0);
+      const raw = new Float32Array(n * 4);
+      gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, raw);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.deleteFramebuffer(fbo);
 
-      const intensity = new Uint32Array(n);
+      // Raw value -> fixed-point integer (scale 1 for integer dtypes, exact),
+      // matching u32(raw * SCALE) in the WebGPU stats shader.
+      const intensity = new Float64Array(n);
       for (let i = 0; i < n; i++) {
-          // Same fixed-point scaling as u32(color.r * 10000.0) in the WebGPU stats shader
-          intensity[i] = Math.floor((rgba[i * 4] / 255) * 10000);
+          intensity[i] = Math.floor(raw[i * 4] * this.intensityScale);
       }
 
       this.denseStats = accumulateStats(this.labels, intensity, this.width, this.height);
@@ -504,7 +520,7 @@ export class WebGl2Backend {
   destroy() {
       const gl = this.gl;
       if (!gl) return;
-      [this.originalTexture, this.horizTexture, this.featTexture0,
+      [this.rawIntensityTexture, this.horizTexture, this.featTexture0,
        this.featTexture1, this.probTexture].forEach(t => { if (t) gl.deleteTexture(t); });
       [this.horizFbo, this.featFbo, this.probFbo].forEach(f => { if (f) gl.deleteFramebuffer(f); });
       [this.progHoriz, this.progVert, this.progRF, this.progComposite].forEach(p => { if (p) gl.deleteProgram(p); });
@@ -611,12 +627,15 @@ export function cclLabel(mask, width, height) {
 }
 
 /**
- * Accumulates per-label metrics into the same dense 7-field u32 structs as
- * WebGpuBackend.downloadStats: label, area, total_intensity, sum_x, sum_y,
- * min_intensity, max_intensity. Exported for testing outside the browser.
+ * Accumulates per-label metrics into the same dense structs as
+ * WebGpuBackend.downloadStats (see STATS_LAYOUT): label, area, total_intensity
+ * {lo,hi}, sum_x {lo,hi}, sum_y {lo,hi}, min_intensity, max_intensity. The summed
+ * fields are 64-bit, split into two u32 words to match the WebGPU accumulator's
+ * paired-atomic layout; sums are computed exactly in JS (f64 is exact to 2^53) and
+ * then split. Exported for testing outside the browser.
  */
 export function accumulateStats(labels, intensity, width, height) {
-    const structCount = 7;
+    const structCount = STATS_LAYOUT.denseCount;
     const rowIndex = new Map(); // label -> index into rows
     const rows = [];
 
@@ -644,17 +663,21 @@ export function accumulateStats(labels, intensity, width, height) {
         }
     }
 
+    // Split a JS number into low/high 32-bit words (little-endian: [lo, hi]).
+    const lo = (v) => v >>> 0;
+    const hi = (v) => Math.floor(v / 2 ** 32);
+
     const out = new Uint32Array(rows.length * structCount);
     for (let s = 0; s < rows.length; s++) {
         const r = rows[s];
         const o = s * structCount;
-        out[o] = r.label;
+        out[o]     = r.label;
         out[o + 1] = r.area;
-        out[o + 2] = r.total;
-        out[o + 3] = r.sumX;
-        out[o + 4] = r.sumY;
-        out[o + 5] = r.min;
-        out[o + 6] = r.max;
+        out[o + 2] = lo(r.total); out[o + 3] = hi(r.total);
+        out[o + 4] = lo(r.sumX);  out[o + 5] = hi(r.sumX);
+        out[o + 6] = lo(r.sumY);  out[o + 7] = hi(r.sumY);
+        out[o + 8] = r.min;
+        out[o + 9] = r.max;
     }
     return out;
 }
@@ -877,17 +900,19 @@ void main() {
 const FS_COMPOSITE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
-uniform sampler2D u_original;
+uniform sampler2D u_original; // R32F raw intensity in the red channel
 uniform sampler2D u_probs;
-uniform float u_winLo; // display contrast black point (normalized [0,1])
-uniform float u_winHi; // display contrast white point (normalized [0,1])
+uniform float u_winLo; // display contrast black point (raw intensity units)
+uniform float u_winHi; // display contrast white point (raw intensity units)
 
 out vec4 fragColor;
 
 void main() {
-  vec4 raw = texture(u_original, v_uv);
-  // Display-only contrast window: remap [lo,hi] -> [0,1]. Identity when lo=0,hi=1.
-  raw.rgb = clamp((raw.rgb - u_winLo) / max(u_winHi - u_winLo, 1e-4), 0.0, 1.0);
+  // Read raw intensity (red channel) and apply the display-only contrast window
+  // [lo,hi] -> [0,1] in raw units, broadcast to gray.
+  float raw_val = texture(u_original, v_uv).r;
+  float v = clamp((raw_val - u_winLo) / max(u_winHi - u_winLo, 1e-4), 0.0, 1.0);
+  vec4 raw = vec4(v, v, v, 1.0);
   vec4 probs = texture(u_probs, v_uv);
   
   float max_p = -1.0;

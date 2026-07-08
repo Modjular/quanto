@@ -15,7 +15,19 @@ export const CAMERA_ZOOM_MIN = 0.1;
 export const CAMERA_ZOOM_MAX = 32;
 export const CAMERA_ZOOM_SENSITIVITY = 0.01;
 export const TRAIN_DEBOUNCE_MS = 300;
-// Default display contrast window, in the normalized [0,1] display space produced
-// by intensityToRGBA's auto-stretch. lo=0/hi=1 is an identity remap, so images look
-// exactly as they do today until the user adjusts the per-image contrast control.
-export const CONTRAST_DEFAULT = { lo: 0.0, hi: 1.0 };
+
+// Layout of the per-object stats structs both backends produce (see the WGSL
+// STATS_ACCUMULATOR_SHADER / COMPACT_STATS_SHADER in webgpu.js and accumulateStats
+// in webgl2.js). The summed fields (total_intensity, sum_x, sum_y) are stored as
+// 64-bit values split across two u32 words (lo, hi) so they can't overflow on large
+// components — WGSL has no atomic<u64>, so the accumulator emulates it with paired
+// u32 atomics. Single source of truth for the field count so consumers stay in sync.
+//
+// Sparse (per-label accumulator, no `label`): area, total_lo, total_hi, sumx_lo,
+//   sumx_hi, sumy_lo, sumy_hi, min_intensity, max_intensity  → 9 u32.
+// Dense (compacted, `label` prepended): the above with `label` first → 10 u32.
+export const STATS_LAYOUT = {
+    sparseCount: 9,
+    denseCount: 10,
+    minIndex: 7, // index of min_intensity within the sparse struct (seeded to 0xFFFFFFFF)
+};
