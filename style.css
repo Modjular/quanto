@@ -274,6 +274,22 @@ button:disabled {
     color: var(--text-light);
 }
 
+.img-contrast {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: var(--text-disabled);
+    font-size: 13px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: var(--radius-sm);
+    line-height: 1;
+}
+.img-contrast:hover {
+    background: var(--accent-subtle-hover);
+    color: var(--text-light);
+}
+
 /* Async Processing states */
 .img-row.loading .img-row-header {
     opacity: 0.5;
@@ -377,6 +393,95 @@ button:disabled {
     line-height: 1.4;
     color: var(--text-muted);
     margin: 0;
+}
+
+/* ── Per-image Contrast Popover ───────────────────────────────────── */
+.contrast-popover {
+    position: fixed;
+    z-index: 1000;
+    width: 200px;
+    display: none;
+    /* Override .heavy-panel's inset shadow with a floating drop shadow. */
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+/* Dual-thumb "contrast limits" slider: two range inputs stacked over one track. */
+.contrast-slider {
+    position: relative;
+    height: 22px;
+    margin: 2px 0;
+}
+.contrast-slider::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 3px;
+    transform: translateY(-50%);
+    background: var(--bg-control);
+    border-radius: 2px;
+}
+.contrast-slider input[type="range"] {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 22px;
+    margin: 0;
+    background: none;
+    -webkit-appearance: none;
+    appearance: none;
+    pointer-events: none; /* track ignores clicks; only thumbs are interactive */
+}
+.contrast-slider input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    pointer-events: auto;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent-primary);
+    border: 2px solid var(--text-light);
+    cursor: pointer;
+}
+.contrast-slider input[type="range"]::-moz-range-thumb {
+    pointer-events: auto;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent-primary);
+    border: 2px solid var(--text-light);
+    cursor: pointer;
+}
+.contrast-slider input[type="range"]::-moz-range-track {
+    background: none;
+}
+
+.contrast-readout {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.contrast-readout b {
+    color: var(--text-dim);
+    font-weight: 600;
+}
+
+.contrast-auto {
+    align-self: flex-start;
+    background: var(--accent-subtle);
+    color: var(--text-dim);
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    padding: 3px 10px;
+    cursor: pointer;
+}
+.contrast-auto:hover {
+    background: var(--accent-subtle-hover);
+    color: var(--text-light);
 }
 
 /* ── Viewport Canvas Board ────────────────────────────────────────── */
