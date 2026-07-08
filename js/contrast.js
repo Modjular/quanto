@@ -1,5 +1,3 @@
-import { CONTRAST_DEFAULT } from './config.js';
-
 // A single shared popover reused for whichever image row is active — napari-style
 // per-layer contrast limits. The popover edits the image's display-only window
 // (black/white points) via backend.setWindow, which only re-runs the composite
@@ -51,12 +49,6 @@ export function openContrastPopover(state, imgId, anchorEl) {
         img.backend.setWindow(img.windowLo, img.windowHi);
         render();
     };
-    popoverEl.querySelector('.contrast-auto').onclick = () => {
-        img.windowLo = CONTRAST_DEFAULT.lo;
-        img.windowHi = CONTRAST_DEFAULT.hi;
-        img.backend.setWindow(img.windowLo, img.windowHi);
-        render();
-    };
 
     render();
     positionPopover(popoverEl, anchorEl);
@@ -84,7 +76,6 @@ function buildPopover() {
                 <span>Black <b class="contrast-lo-val">0.00</b></span>
                 <span>White <b class="contrast-hi-val">1.00</b></span>
             </div>
-            <button class="contrast-auto">Auto</button>
         </div>`;
     // Clicks inside the popover must not bubble to the document dismiss handler.
     el.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -98,8 +89,13 @@ function buildPopover() {
     return el;
 }
 
-// Anchors the popover to the right of its row, flipping left/clamping to stay
-// on screen (the sidebar is a fixed-width column, so "right" floats over the viewport).
+// Anchors the popover beside the row button and vertically centers it on that
+// button so the caret lines up. Defaults to the button's right (the sidebar is a
+// fixed-width column, so "right" floats over the viewport); flips left if it would
+// overrun the window edge.
+const GAP = 10;      // space between button and popover for the caret
+const CARET_HALF = 8; // half the caret's height (see .contrast-popover::before)
+
 function positionPopover(el, anchorEl) {
     const rect = anchorEl.getBoundingClientRect();
     el.style.visibility = 'hidden';
@@ -107,12 +103,20 @@ function positionPopover(el, anchorEl) {
     const pw = el.offsetWidth;
     const ph = el.offsetHeight;
 
-    let left = rect.right + 8;
-    if (left + pw > window.innerWidth - 8) left = rect.left - pw - 8; // flip to left side
-    let top = rect.top;
-    if (top + ph > window.innerHeight - 8) top = window.innerHeight - ph - 8;
+    // Horizontal: right of the button, or flipped to the left if it won't fit.
+    let left = rect.right + GAP;
+    const onLeft = left + pw > window.innerWidth - 8;
+    if (onLeft) left = rect.left - pw - GAP;
+    el.classList.toggle('on-left', onLeft);
 
+    // Vertical: center on the button, clamped to stay on screen.
+    const buttonCenterY = rect.top + rect.height / 2;
+    let top = buttonCenterY - ph / 2;
+    top = Math.max(8, Math.min(top, window.innerHeight - ph - 8));
+
+    // Point the caret tip at the button center even after clamping.
+    el.style.setProperty('--caret-top', (buttonCenterY - top - CARET_HALF) + 'px');
     el.style.left = Math.max(8, left) + 'px';
-    el.style.top  = Math.max(8, top) + 'px';
+    el.style.top  = top + 'px';
     el.style.visibility = 'visible';
 }
