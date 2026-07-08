@@ -1,4 +1,4 @@
-import { MIN_LABELS_TO_TRAIN, RF_CONFIG, TRAIN_DEBOUNCE_MS } from './config.js';
+import { MIN_LABELS_TO_TRAIN, NUM_FEATURES, RF_CONFIG, TRAIN_DEBOUNCE_MS } from './config.js';
 import { updateClassStatBadges } from './ui.js';
 
 // Fields per object in the dense stats struct backends return from downloadStats:
@@ -58,7 +58,7 @@ export async function trainAndPredictAll(state) {
     }
 
     const { combinedX, yArray } = await buildTrainingDataset(state.images, totalLabels);
-    state.rf.train(combinedX, yArray, RF_CONFIG.numTrees);
+    state.rf.train(combinedX, yArray, NUM_FEATURES);
 
     for (const img of state.images) {
         await img.backend.runInference(state.rf);
