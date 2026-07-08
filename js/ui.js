@@ -23,6 +23,15 @@ export function refreshEmptyState(state) {
         state.images.length === 0 ? '' : 'none';
 }
 
+// counts[classIdx] = number of detected objects for that class, summed across
+// all loaded images.
+export function updateClassStatBadges(counts) {
+    counts.forEach((count, index) => {
+        const badge = document.getElementById(`stat-class-${index}`);
+        if (badge) badge.textContent = count;
+    });
+}
+
 // createImageRow — builds the DOM for one entry.
 // The controller supplies { onReorder(direction), onDelete() } so this view
 // stays decoupled from the image-lifecycle module.
