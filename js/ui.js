@@ -23,14 +23,13 @@ export function refreshEmptyState(state) {
         state.images.length === 0 ? '' : 'none';
 }
 
-export function updateImageStateBadge(imgState) {
-    const badge = imgState._sidebarRow.querySelector('.img-label-badge');
-    const count = imgState.labels.length;
-
-    if (!badge) return;
-
-    badge.textContent = count === 0 ? 'no labels' : `${count} label${count !== 1 ? 's' : ''}`;
-    badge.classList.toggle('has-labels', count > 0);
+// counts[classIdx] = number of detected objects for that class, summed across
+// all loaded images.
+export function updateClassStatBadges(counts) {
+    counts.forEach((count, index) => {
+        const badge = document.getElementById(`stat-class-${index}`);
+        if (badge) badge.textContent = count;
+    });
 }
 
 // createImageRow — builds the DOM for one entry.
@@ -65,10 +64,6 @@ export function createImageRow(imgId, name, { onReorder, onDelete }) {
     nameEl.textContent = name;
     nameEl.title       = name;
 
-    const badge = document.createElement('div');
-    badge.className = 'img-label-badge';
-    badge.dataset.badge = imgId;
-
     const btnDel = document.createElement('button');
     btnDel.className   = 'img-delete';
     btnDel.textContent = '✕';
@@ -77,7 +72,6 @@ export function createImageRow(imgId, name, { onReorder, onDelete }) {
 
     header.appendChild(reorder);
     header.appendChild(nameEl);
-    header.appendChild(badge);
     header.appendChild(btnDel);
 
     row.appendChild(loadBar);

@@ -1,4 +1,9 @@
 import { MIN_LABELS_TO_TRAIN, RF_CONFIG, TRAIN_DEBOUNCE_MS } from './config.js';
+import { updateClassStatBadges } from './ui.js';
+
+// Fields per object in the dense stats struct backends return from downloadStats:
+// label, area, total_intensity, sum_x, sum_y, min_intensity, max_intensity.
+const STATS_FIELDS_PER_OBJECT = 7;
 
 /**
  * Aggregates features and labels across all images into 1D typed arrays for Random Forest training.
@@ -47,7 +52,10 @@ export function scheduleTraining(state) {
 
 export async function trainAndPredictAll(state) {
     const totalLabels = state.images.reduce((s, i) => s + i.labels.length, 0);
-    if (totalLabels < MIN_LABELS_TO_TRAIN) return;
+    if (totalLabels < MIN_LABELS_TO_TRAIN) {
+        updateClassStatBadges(new Array(RF_CONFIG.numClasses).fill(0));
+        return;
+    }
 
     const { combinedX, yArray } = await buildTrainingDataset(state.images, totalLabels);
     state.rf.train(combinedX, yArray, RF_CONFIG.numTrees);
@@ -55,4 +63,29 @@ export async function trainAndPredictAll(state) {
     for (const img of state.images) {
         await img.backend.runInference(state.rf);
     }
+
+    await updateObjectCounts(state);
+}
+
+// Runs connected-component labeling + stats per class, per image, and pushes the summed object counts into the class-selector badges.
+async function updateObjectCounts(state) {
+    const numClasses = RF_CONFIG.numClasses;
+    const counts = new Array(numClasses).fill(0);
+
+    for (const img of state.images) {
+        for (let cls = 0; cls < numClasses; cls++) {
+            await img.backend.computeConnectedComponents(cls);
+            const statsResult = await img.backend.computeStats();
+            // WebGpuBackend.computeStats returns null (and leaves its stats
+            // buffers untouched) when this class had no pixels above threshold.
+            // Skip the download in that case, or we'd read the previous class's
+            // stale counts back out.
+            if (statsResult === null) continue;
+
+            const stats = await img.backend.downloadStats();
+            counts[cls] += stats.length / STATS_FIELDS_PER_OBJECT;
+        }
+    }
+
+    updateClassStatBadges(counts);
 }
