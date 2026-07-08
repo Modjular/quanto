@@ -153,7 +153,6 @@ input[type="range"]::-webkit-slider-thumb {
     margin-top: -6px; /* center the 14px thumb on the 3px track */
     border-radius: 50%;
     background: var(--accent-primary);
-    border: 2px solid var(--text-light);
     cursor: pointer;
 }
 input[type="range"]::-moz-range-thumb {
@@ -161,7 +160,6 @@ input[type="range"]::-moz-range-thumb {
     height: 14px;
     border-radius: 50%;
     background: var(--accent-primary);
-    border: 2px solid var(--text-light);
     cursor: pointer;
 }
 
@@ -437,9 +435,6 @@ button:disabled {
     z-index: 1000;
     width: 200px;
     display: none;
-    /* A more visible border than .heavy-panel's faint default, plus a floating
-       drop shadow in place of its inset shadow. */
-    border-color: var(--border-control);
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
 /* Caret pointing at the row button. Default: popover sits to the button's right,
@@ -457,7 +452,7 @@ button:disabled {
 }
 .contrast-popover::before { /* border-colored triangle */
     left: -8px;
-    border-right: 8px solid var(--border-control);
+    border-right: 8px solid var(--border-subtle);
 }
 .contrast-popover::after {  /* fill triangle, inset 1px to reveal the border */
     left: -7px;
@@ -468,7 +463,7 @@ button:disabled {
     left: auto;
     right: -8px;
     border-right: none;
-    border-left: 8px solid var(--border-control);
+    border-left: 8px solid var(--border-subtle);
 }
 .contrast-popover.on-left::after {
     left: auto;
