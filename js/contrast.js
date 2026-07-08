@@ -31,9 +31,21 @@ export function openContrastPopover(state, imgId, anchorEl) {
     const loVal     = popoverEl.querySelector('.contrast-lo-val');
     const hiVal     = popoverEl.querySelector('.contrast-hi-val');
 
+    // The handles span the image's real range (e.g. 0–65535 for uint16) rather than a
+    // normalized 0–1, so black/white points read in the source's true intensity units.
+    const { dtypeMax } = img.range;
+    const isInteger = Number.isInteger(dtypeMax) && dtypeMax >= 255;
+    const step = isInteger ? 1 : dtypeMax / 1000;
+    for (const input of [loInput, hiInput]) {
+        input.min = 0;
+        input.max = dtypeMax;
+        input.step = step;
+    }
+    const fmt = (v) => isInteger ? Math.round(v).toString() : v.toFixed(3);
+
     const render = () => {
-        loVal.textContent = img.windowLo.toFixed(2);
-        hiVal.textContent = img.windowHi.toFixed(2);
+        loVal.textContent = fmt(img.windowLo);
+        hiVal.textContent = fmt(img.windowHi);
         loInput.value = img.windowLo;
         hiInput.value = img.windowHi;
     };

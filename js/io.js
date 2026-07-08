@@ -4,14 +4,27 @@ import { readImage, setPipelinesBaseUrl } from './vendor/itk-wasm-image-io.min.j
 // vendored copy instead of the jsDelivr CDN default.
 setPipelinesBaseUrl(new URL('./vendor/itk-wasm-image-io-pipelines', import.meta.url).href);
 
+// Max value of each itk integer component type — used as the upper bound of the
+// contrast slider so it spans the dtype's real range (e.g. 0–65535 for uint16).
+// Float types have no fixed max (signalled by null; the slider falls back to the
+// data's own max).
+const DTYPE_MAX = {
+    uint8: 255, int8: 127,
+    uint16: 65535, int16: 32767,
+    uint32: 4294967295, int32: 2147483647,
+};
 
 /**
- * Loads an image file into a typed array, handling both TIFFs and standard web formats.
+ * Loads an image file into a raw single-channel intensity array plus display
+ * range metadata. Unlike the old path, the returned intensities are the *raw*
+ * pixel values (e.g. a uint16 TIFF yields values up to 65535), not a 0–1
+ * min–max stretch — features, stats, and the contrast control all operate in
+ * real units. Display windowing happens on the GPU from these raw values.
  * @param {File} file - The image file to load.
- * @returns {Promise<{intensityArray: Float32Array, rgba: Uint8Array|Uint8ClampedArray, w: number, h: number}>} An object containing the normalized intensity array, the raw RGBA array, and the dimensions.
+ * @returns {Promise<{intensityArray: Float32Array, w: number, h: number, shape: number[], range: {dataMin: number, dataMax: number, dtypeMax: number, scale: number}}>}
  */
 export async function loadFileIntoArray(file) {
-  let data, rgba, w, h, shape;
+  let intensityArray, w, h, shape, dtypeMax, scale;
 
   if (file.name.endsWith('.tif') || file.name.endsWith('.tiff')) {
     // webWorker: false — the bundled worker runs from a data: URL (opaque origin), which
@@ -21,58 +34,61 @@ export async function loadFileIntoArray(file) {
 
     w = image.size[0]
     h = image.size[1]
-    rgba = new Uint8Array(image.data.length * 4)
-    data = image.data
     shape = image.size
+    // Keep the raw pixel magnitudes; widen to f32 for the GPU (which represents
+    // integers exactly up to 2^24, so uint16 is lossless).
+    intensityArray = image.data instanceof Float32Array
+        ? image.data
+        : Float32Array.from(image.data);
+
+    const componentType = image.imageType?.componentType;
+    const isFloat = componentType === 'float32' || componentType === 'float64';
+    dtypeMax = DTYPE_MAX[componentType] ?? null; // null → float, no fixed max
+    // Stats accumulate a fixed-point integer per pixel. Integer dtypes are already
+    // integers (scale 1, exact); float dtypes get a documented scale so fractional
+    // intensities survive the integer accumulator. 64-bit accumulation (see
+    // STATS_LAYOUT) absorbs the larger magnitudes either way.
+    scale = isFloat ? 1000 : 1;
   } else {
     const img = await createImageBitmap(file);
     w = img.width;
     h = img.height;
+    shape = [w, h];
     const off = new OffscreenCanvas(w, h);
     const ctx = off.getContext('2d');
     ctx.drawImage(img, 0, 0);
-    rgba = ctx.getImageData(0, 0, w, h).data;
-    data = new Float32Array(w * h)
-    shape = [w, h]
+    const rgba = ctx.getImageData(0, 0, w, h).data;
 
-    // Convert RGBA to intensity
+    // Raw luma in 0–255 units (these formats decode to 8-bit), keeping display
+    // and stats in the source's real range rather than a 0–1 stretch.
+    intensityArray = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) {
-        const r = rgba[i * 4] / 255;
-        const g = rgba[i * 4 + 1] / 255;
-        const b = rgba[i * 4 + 2] / 255;
-        data[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+        intensityArray[i] = 0.299 * r + 0.587 * g + 0.114 * b;
     }
+    dtypeMax = 255;
+    scale = 1;
   }
 
-  const intensityArray = new Float32Array(w * h);
-  intensityToRGBA(data, rgba, intensityArray);
+  const { dataMin, dataMax } = computeMinMax(intensityArray);
+  // Float images have no fixed dtype max, so the slider spans the data's range.
+  const range = { dataMin, dataMax, dtypeMax: dtypeMax ?? dataMax, scale };
 
-  return { intensityArray, rgba, w, h, shape}
+  return { intensityArray, w, h, shape, range }
 }
 
 /**
- * Normalizes an intensity array and converts it to RGBA.
- * @param {Float32Array|Array} data - The input data to normalize.
- * @param {Uint8Array|Uint8ClampedArray} rgba - Array to write RGBA values.
- * @param {Float32Array} [intensityArray] - Optional array to write normalized intensities.
+ * Scans an intensity array for its min and max. Pure and dependency-free.
+ * @param {Float32Array|Array<number>} data
+ * @returns {{dataMin: number, dataMax: number}} Both 0 for an empty array.
  */
-export function intensityToRGBA(data, rgba, intensityArray) {
-    let [min, max] = [Infinity, -Infinity];
-    const n = data.length;
-    for (let i = 0; i < n; i++) {
-        if (data[i] < min) min = data[i];
-        if (data[i] > max) max = data[i];
+export function computeMinMax(data) {
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+        const v = data[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
     }
-
-    const range = (max - min) > 0 ? (max - min) : 255;
-    for (let i = 0; i < n; i++) {
-        const norm = (data[i] - min) / range;
-        if (intensityArray) intensityArray[i] = norm;
-
-        const val8 = norm * 255;
-        rgba[i * 4] = val8;
-        rgba[i * 4 + 1] = val8;
-        rgba[i * 4 + 2] = val8;
-        rgba[i * 4 + 3] = 255;
-    }
+    if (!Number.isFinite(min)) { min = 0; max = 0; }
+    return { dataMin: min, dataMax: max };
 }

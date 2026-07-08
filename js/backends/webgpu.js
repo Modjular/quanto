@@ -15,6 +15,8 @@
  * them; a render pass composites the argmax overlay. Data is only read back to
  * the CPU on demand through the download* methods.
  */
+import { STATS_LAYOUT } from '../config.js';
+
 export class WebGpuBackend {
     constructor(labelColors) {
         this.device = null;
@@ -22,7 +24,12 @@ export class WebGpuBackend {
         this.format = null;
         this.width = 0;
         this.height = 0;
-        this.originalTexture = null;
+        // Raw single-channel intensity (r32float), shared by the stats pass and the
+        // display window/level in the composite pass. Holds real pixel magnitudes.
+        this.rawIntensityTexture = null;
+        // Fixed-point multiplier applied to raw intensity before integer accumulation
+        // in computeStats (1 for integer dtypes, larger for float). Set per image.
+        this.intensityScale = 1;
         this.featureBuffer = null;
         this.probBuffer = null;
         this.labelBuffer = null;
@@ -35,8 +42,8 @@ export class WebGpuBackend {
             'rgba(0,0,255,1.0)',
         ];
 
-        // Display-only contrast window (black/white points) in normalized [0,1]
-        // space. Identity by default; see setWindow.
+        // Display-only contrast window (black/white points) in the image's raw
+        // intensity units. Seeded to the data range in allocateImage; see setWindow.
         this.windowLo = 0.0;
         this.windowHi = 1.0;
     }
@@ -110,25 +117,33 @@ export class WebGpuBackend {
     }
 
     /**
-     * (Re)allocates the per-image GPU resources (original texture, probability
+     * (Re)allocates the per-image GPU resources (raw intensity texture, probability
      * and label buffers), freeing any previous ones, and seeds probabilities to
      * -1 (the "unclassified" sentinel). Feature/stats buffers are cleared and
-     * rebuilt lazily on the next updateFeatures/computeStats.
+     * rebuilt lazily on the next updateFeatures/computeStats. Also seeds the
+     * contrast window and stats fixed-point scale from the image's range metadata.
      * @param {number} width
      * @param {number} height
-     * @param {Uint8Array|Uint8ClampedArray} rgbaData - Source RGBA pixels.
+     * @param {Float32Array} intensityArray - Raw single-channel intensities.
+     * @param {{dataMin: number, dataMax: number, dtypeMax: number, scale: number}} range
      */
-    async allocateImage(width, height, rgbaData) {
+    async allocateImage(width, height, intensityArray, range) {
         this.width = width;
         this.height = height;
+        this.intensityScale = range.scale;
+        // Default the display window to the data range → reproduces the auto-stretch look.
+        this.windowLo = range.dataMin;
+        this.windowHi = range.dataMax;
 
-        if (this.originalTexture) this.originalTexture.destroy();
-        this.originalTexture = this.device.createTexture({
+        if (this.rawIntensityTexture) this.rawIntensityTexture.destroy();
+        this.rawIntensityTexture = this.device.createTexture({
             size: [width, height],
-            format: 'rgba8unorm',
+            format: 'r32float',
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
         });
-        this.device.queue.writeTexture({ texture: this.originalTexture }, rgbaData, { bytesPerRow: width * 4 }, [width, height]);
+        // 4 bytes per r32float texel. textureLoad (no filtering) reads it in both the
+        // stats compute pass and the composite fragment shader.
+        this.device.queue.writeTexture({ texture: this.rawIntensityTexture }, intensityArray, { bytesPerRow: width * 4 }, [width, height]);
 
         const numColors = this.labelColors.length;
         if (this.probBuffer) this.probBuffer.destroy();
@@ -264,7 +279,7 @@ export class WebGpuBackend {
         // PASS 2: Accumulate Statistics
         // =========================================================
 
-        const statsStructCount = 6;
+        const statsStructCount = STATS_LAYOUT.sparseCount;
         const statsSize = maxExpectedLabels * statsStructCount * 4;
 
         if (this.statsBuffer) this.statsBuffer.destroy();
@@ -275,14 +290,16 @@ export class WebGpuBackend {
 
         const initData = new Uint32Array(maxExpectedLabels * statsStructCount);
         for (let i = 0; i < maxExpectedLabels; i++) {
-            initData[i * statsStructCount + 4] = 0xFFFFFFFF; // Set min_intensity to max u32
+            initData[i * statsStructCount + STATS_LAYOUT.minIndex] = 0xFFFFFFFF; // min_intensity seeded to max u32
         }
         this.device.queue.writeBuffer(this.statsBuffer, 0, initData);
 
         const statsCode = STATS_ACCUMULATOR_SHADER
             .replace(/{{WIDTH}}/g, this.width)
             .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels);
+            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels)
+            // Raw intensity → fixed-point integer; 1.0 for integer dtypes (exact).
+            .replace(/{{SCALE}}/g, this.intensityScale.toFixed(6));
 
         const statsEncoder = this.device.createCommandEncoder();
         this._addComputePass(statsEncoder, {
@@ -290,7 +307,7 @@ export class WebGpuBackend {
             entryPoint: 'main',
             bindings: [
                 { binding: 0, resource: { buffer: this.labelBuffer } },
-                { binding: 1, resource: this.originalTexture.createView() },
+                { binding: 1, resource: this.rawIntensityTexture.createView() },
                 { binding: 2, resource: { buffer: this.statsBuffer } }
             ],
             dispatchX, dispatchY
@@ -307,7 +324,7 @@ export class WebGpuBackend {
         });
         this.device.queue.writeBuffer(counterBuffer, 0, new Uint32Array([0]));
 
-        const denseStructCount = 7;
+        const denseStructCount = STATS_LAYOUT.denseCount;
         const maxDenseSize = maxExpectedLabels * denseStructCount * 4;
         const compactStatsBuffer = this.device.createBuffer({
             size: maxDenseSize,
@@ -339,9 +356,10 @@ export class WebGpuBackend {
     }
 
     /**
-     * Reads back the compacted per-object stats from the last computeStats call
-     * as dense 7-field structs (label, area, total_intensity, sum_x, sum_y, min,
-     * max). Empty if no objects were found.
+     * Reads back the compacted per-object stats from the last computeStats call as
+     * dense structs (see STATS_LAYOUT): label, area, total_intensity {lo,hi},
+     * sum_x {lo,hi}, sum_y {lo,hi}, min, max. The summed fields are 64-bit, split
+     * across two u32 words — reassemble as hi*2^32 + lo. Empty if no objects found.
      * @returns {Promise<Uint32Array>}
      */
     async downloadStats() {
@@ -351,8 +369,7 @@ export class WebGpuBackend {
         // If no objects were found, bail early!
         if (numObjects === 0) return new Uint32Array(0);
 
-        const denseStructCount = 7; // label, area, total_intensity, sum_x, sum_y, min, max
-        const bytesToCopy = numObjects * denseStructCount * 4;
+        const bytesToCopy = numObjects * STATS_LAYOUT.denseCount * 4;
 
         return this._readBuffer(this.statsBuffer, bytesToCopy, Uint32Array);
     }
@@ -689,7 +706,7 @@ export class WebGpuBackend {
 
     /** Paints the canvas: the original image with the argmax class overlaid where classified. */
     renderComposite() {
-        if (!this.originalTexture || !this.probBuffer) return;
+        if (!this.rawIntensityTexture || !this.probBuffer) return;
 
         const colors = this.labelColors;
         const colorsWGSL = colors.map(parseColorToWGSL).join(',\n            ');
@@ -699,7 +716,8 @@ export class WebGpuBackend {
             .replace(/{{HEIGHT}}/g, this.height)
             .replace(/{{NUM_COLORS}}/g, colors.length)
             .replace(/{{COLORS_ARRAY}}/g, colorsWGSL)
-            // Formatted with a decimal point so they parse as WGSL f32 literals.
+            // Window bounds are in raw intensity units; format with a decimal point
+            // so they parse as WGSL f32 literals.
             .replace(/{{WIN_LO}}/g, this.windowLo.toFixed(6))
             .replace(/{{WIN_HI}}/g, this.windowHi.toFixed(6));
 
@@ -714,9 +732,9 @@ export class WebGpuBackend {
         const bindGroup = this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: this.device.createSampler() },
-                { binding: 1, resource: this.originalTexture.createView() },
-                { binding: 2, resource: { buffer: this.probBuffer } }
+                // r32float is unfilterable, so the composite uses textureLoad (no sampler).
+                { binding: 0, resource: this.rawIntensityTexture.createView() },
+                { binding: 1, resource: { buffer: this.probBuffer } }
             ]
         });
 
@@ -737,7 +755,7 @@ export class WebGpuBackend {
 
     /**
      * Sets the display-only contrast window (black point `lo`, white point `hi`,
-     * both in normalized [0,1] display space) and repaints. This only affects the
+     * in the image's raw intensity units) and repaints. This only affects the
      * composite pass — it does not touch the intensity data fed to feature
      * extraction, so classification is unchanged and no retrain is triggered.
      * @param {number} lo - Black point; pixels <= lo render black.
@@ -762,7 +780,7 @@ export class WebGpuBackend {
 
     /** Frees all GPU textures and buffers held by this backend. */
     destroy() {
-        if (this.originalTexture)    { this.originalTexture.destroy();    this.originalTexture = null; }
+        if (this.rawIntensityTexture) { this.rawIntensityTexture.destroy(); this.rawIntensityTexture = null; }
         if (this.featureBuffer)      { this.featureBuffer.destroy();      this.featureBuffer = null; }
         if (this.probBuffer)         { this.probBuffer.destroy();         this.probBuffer = null; }
         if (this.labelBuffer)        { this.labelBuffer.destroy();        this.labelBuffer = null; }
@@ -966,19 +984,21 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-@group(0) @binding(0) var s: sampler;
-@group(0) @binding(1) var t_raw: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read> p_map: array<f32>;
+@group(0) @binding(0) var t_raw: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read> p_map: array<f32>;
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    var raw = textureSample(t_raw, s, uv);
-    // Display-only contrast window: remap [lo,hi] -> [0,1]. Identity at lo=0,hi=1.
-    raw = vec4(clamp((raw.rgb - {{WIN_LO}}) / max({{WIN_HI}} - {{WIN_LO}}, 1e-4), vec3(0.0), vec3(1.0)), raw.a);
     let w = u32({{WIDTH}});
     let h = u32({{HEIGHT}});
     let x = u32(uv.x * f32(w));
     let y = u32(uv.y * f32(h));
+
+    // Read the raw intensity (r32float, unfilterable → textureLoad) and apply the
+    // display-only contrast window [lo,hi] -> [0,1] in raw units, broadcast to gray.
+    let raw_val = textureLoad(t_raw, vec2<i32>(i32(x), i32(y)), 0).r;
+    let v = clamp((raw_val - {{WIN_LO}}) / max({{WIN_HI}} - {{WIN_LO}}, 1e-4), 0.0, 1.0);
+    let raw = vec4<f32>(v, v, v, 1.0);
 
     let base_idx = clamp(y * w + x, 0u, w * h - 1u) * {{NUM_COLORS}}u;
     var max_p: f32 = -1.0;
@@ -1142,11 +1162,18 @@ fn main(
 * High-Speed Topology Statistics Accumulator
 */
 const STATS_ACCUMULATOR_SHADER = `
+// Summed fields are 64-bit, split into {lo, hi} u32 words. WGSL has no atomic<u64>,
+// so add64 emulates it: add into the low word, and on wrap carry 1 into the high
+// word. Exact and deterministic (integer add is associative). See STATS_LAYOUT.
+// The lo/hi pair is grouped into a U64 struct so add64 takes a single pointer —
+// WGSL forbids passing two pointers into the same buffer to one function (they'd
+// be treated as aliasing). Layout is identical to nine consecutive u32.
+struct U64 { lo: atomic<u32>, hi: atomic<u32> };
 struct Metrics {
     area: atomic<u32>,
-    total_intensity: atomic<u32>,
-    sum_x: atomic<u32>,
-    sum_y: atomic<u32>,
+    total: U64,
+    sum_x: U64,
+    sum_y: U64,
     min_intensity: atomic<u32>,
     max_intensity: atomic<u32>
 };
@@ -1154,6 +1181,11 @@ struct Metrics {
 @group(0) @binding(0) var<storage, read> labels: array<u32>;
 @group(0) @binding(1) var raw_intensity: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> stats: array<Metrics>;
+
+fn add64(acc: ptr<storage, U64, read_write>, v: u32) {
+    let old = atomicAdd(&(*acc).lo, v);
+    if (old > 0xffffffffu - v) { atomicAdd(&(*acc).hi, 1u); } // low word wrapped -> carry
+}
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1165,30 +1197,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     if (label == 0u || label >= {{MAX_LABELS}}u) { return; }
 
-    // Read directly from the texture using the X/Y coordinates
-    let color = textureLoad(raw_intensity, vec2<i32>(id.xy), 0);
-    let intensity_f = color.r; // Grab the red channel for intensity
-    // Scale standard normalized float values to fixed-point integer spaces
-    let intensity_u = u32(intensity_f * 10000.0);
+    // Read the raw intensity (red channel) and convert to fixed-point integer.
+    // SCALE is 1.0 for integer dtypes (exact) — see intensityScale in computeStats.
+    let intensity_f = textureLoad(raw_intensity, vec2<i32>(id.xy), 0).r;
+    let intensity_u = u32(intensity_f * {{SCALE}});
 
-    // Accumulate sums
+    // Accumulate: area fits u32 (pixel count); the growing sums use 64-bit add64.
     atomicAdd(&stats[label].area, 1u);
-    atomicAdd(&stats[label].total_intensity, intensity_u);
-    atomicAdd(&stats[label].sum_x, id.x);
-    atomicAdd(&stats[label].sum_y, id.y);
+    add64(&stats[label].total, intensity_u);
+    add64(&stats[label].sum_x, id.x);
+    add64(&stats[label].sum_y, id.y);
 
-    // Evaluate Min/Max
+    // Min/Max don't sum, so a single u32 holds the raw fixed-point value.
     atomicMin(&stats[label].min_intensity, intensity_u);
     atomicMax(&stats[label].max_intensity, intensity_u);
 }
 `;
 
 const COMPACT_STATS_SHADER = `
+// Field layout mirrors STATS_LAYOUT. The 64-bit sums keep their {lo, hi} split in
+// the dense output; the JS side reassembles them as hi*2^32 + lo.
 struct SparseMetrics {
     area: atomic<u32>,
-    total_intensity: atomic<u32>,
-    sum_x: atomic<u32>,
-    sum_y: atomic<u32>,
+    total_lo: atomic<u32>, total_hi: atomic<u32>,
+    sum_x_lo: atomic<u32>, sum_x_hi: atomic<u32>,
+    sum_y_lo: atomic<u32>, sum_y_hi: atomic<u32>,
     min_intensity: atomic<u32>,
     max_intensity: atomic<u32>
 };
@@ -1196,9 +1229,9 @@ struct SparseMetrics {
 struct DenseMetrics {
     label: u32,
     area: u32,
-    total_intensity: u32,
-    sum_x: u32,
-    sum_y: u32,
+    total_lo: u32, total_hi: u32,
+    sum_x_lo: u32, sum_x_hi: u32,
+    sum_y_lo: u32, sum_y_hi: u32,
     min_intensity: u32,
     max_intensity: u32
 };
@@ -1228,9 +1261,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         compact_stats[write_idx].label = label_idx;
         compact_stats[write_idx].area = area;
-        compact_stats[write_idx].total_intensity = atomicLoad(&sparse_stats[label_idx].total_intensity);
-        compact_stats[write_idx].sum_x = atomicLoad(&sparse_stats[label_idx].sum_x);
-        compact_stats[write_idx].sum_y = atomicLoad(&sparse_stats[label_idx].sum_y);
+        compact_stats[write_idx].total_lo = atomicLoad(&sparse_stats[label_idx].total_lo);
+        compact_stats[write_idx].total_hi = atomicLoad(&sparse_stats[label_idx].total_hi);
+        compact_stats[write_idx].sum_x_lo = atomicLoad(&sparse_stats[label_idx].sum_x_lo);
+        compact_stats[write_idx].sum_x_hi = atomicLoad(&sparse_stats[label_idx].sum_x_hi);
+        compact_stats[write_idx].sum_y_lo = atomicLoad(&sparse_stats[label_idx].sum_y_lo);
+        compact_stats[write_idx].sum_y_hi = atomicLoad(&sparse_stats[label_idx].sum_y_hi);
         compact_stats[write_idx].min_intensity = atomicLoad(&sparse_stats[label_idx].min_intensity);
         compact_stats[write_idx].max_intensity = atomicLoad(&sparse_stats[label_idx].max_intensity);
     }

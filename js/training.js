@@ -1,9 +1,10 @@
-import { MIN_LABELS_TO_TRAIN, NUM_FEATURES, RF_CONFIG, TRAIN_DEBOUNCE_MS } from './config.js';
+import { MIN_LABELS_TO_TRAIN, NUM_FEATURES, RF_CONFIG, TRAIN_DEBOUNCE_MS, STATS_LAYOUT } from './config.js';
 import { updateClassStatBadges } from './ui.js';
 
-// Fields per object in the dense stats struct backends return from downloadStats:
-// label, area, total_intensity, sum_x, sum_y, min_intensity, max_intensity.
-const STATS_FIELDS_PER_OBJECT = 7;
+// Fields per object in the dense stats struct backends return from downloadStats
+// (see STATS_LAYOUT): label, area, total_intensity {lo,hi}, sum_x {lo,hi},
+// sum_y {lo,hi}, min_intensity, max_intensity.
+const STATS_FIELDS_PER_OBJECT = STATS_LAYOUT.denseCount;
 
 /**
  * Aggregates features and labels across all images into 1D typed arrays for Random Forest training.
