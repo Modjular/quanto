@@ -35,6 +35,8 @@ export class WebGpuBackend {
         this.labelBuffer = null;
         this.statsBuffer = null;
         this.statsCounterBuffer = null;
+        // Uniform holding the per-call label count for the stats passes (see computeStats).
+        this.statsParamsBuffer = null;
 
         // Composite render pipeline + its window uniform buffer, built once per
         // allocateImage (width/height/colors are fixed for the image's lifetime).
@@ -54,13 +56,12 @@ export class WebGpuBackend {
         this.windowLo = 0.0;
         this.windowHi = 1.0;
 
-        // Compiled compute pipelines keyed by a stable per-pass id. The filter,
-        // inference, gather, find-max, and CCL passes bake only width/height/label
-        // count into their WGSL — constant for the image's lifetime — so they
-        // compile once and are reused across every retrain instead of being rebuilt
-        // per call. Cleared in allocateImage (those constants can change there).
-        // Passes whose code varies per call (the stats accumulator/compaction bake
-        // MAX_LABELS, which tracks the segmentation) opt out by omitting a cacheKey.
+        // Compiled compute pipelines keyed by a stable per-pass id. Every compute
+        // pass bakes only image-lifetime constants (width/height/label-count/scale)
+        // into its WGSL — the per-call label count for the stats passes is passed as
+        // a uniform instead — so each pass compiles once and is reused across every
+        // retrain rather than rebuilt per call. Cleared in allocateImage, where
+        // those baked constants can change. A pass opts out by omitting a cacheKey.
         this._pipelineCache = new Map();
     }
 
@@ -192,6 +193,15 @@ export class WebGpuBackend {
         if (this.featureBuffer) { this.featureBuffer.destroy(); this.featureBuffer = null; }
         if (this.statsBuffer) { this.statsBuffer.destroy(); this.statsBuffer = null; }
         if (this.statsCounterBuffer) { this.statsCounterBuffer.destroy(); this.statsCounterBuffer = null; }
+
+        // Uniform for the stats passes' label count (Params{max_labels:u32}); padded
+        // to 16 bytes to satisfy uniform-buffer sizing. computeStats writes it per call.
+        if (!this.statsParamsBuffer) {
+            this.statsParamsBuffer = this.device.createBuffer({
+                size: 16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+        }
 
         this._buildCompositePipeline();
         // Seed the window uniform to match the windowLo/windowHi set above.
@@ -338,6 +348,11 @@ export class WebGpuBackend {
         this.device.queue.submit([maxEncoder.finish()]);
 
         // --- CPU/GPU SYNC POINT: Halt and wait for the max label ---
+        // DEFERRED PERF (#2): this readback stalls the pipeline once per class per
+        // image, just to size the stats buffer. It could be avoided by allocating
+        // the stats buffers to a worst-case bound (e.g. width*height labels) and
+        // skipping the round-trip — a memory-for-latency trade left until a profiler
+        // says it matters.
         const maxLabelArray = await this._readBuffer(maxLabelBuffer, 4, Uint32Array);
         const maxLabel = maxLabelArray[0];
         maxLabelBuffer.destroy();
@@ -347,6 +362,11 @@ export class WebGpuBackend {
 
         // Labels are 0-indexed, so the required size is maxLabel + 1
         const maxExpectedLabels = maxLabel + 1;
+
+        // Feed the label count to the accumulate/compact passes as a uniform (rather
+        // than baking it into their WGSL) so those pipelines stay cacheable even as
+        // the segmentation — and thus maxExpectedLabels — changes call to call.
+        this.device.queue.writeBuffer(this.statsParamsBuffer, 0, new Uint32Array([maxExpectedLabels]));
 
         // =========================================================
         // PASS 2: Accumulate Statistics
@@ -370,8 +390,8 @@ export class WebGpuBackend {
         const statsCode = STATS_ACCUMULATOR_SHADER
             .replace(/{{WIDTH}}/g, this.width)
             .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels)
             // Raw intensity → fixed-point integer; 1.0 for integer dtypes (exact).
+            // Baked (image-constant), unlike max_labels which is a uniform.
             .replace(/{{SCALE}}/g, this.intensityScale.toFixed(6));
 
         const statsEncoder = this.device.createCommandEncoder();
@@ -381,9 +401,11 @@ export class WebGpuBackend {
             bindings: [
                 { binding: 0, resource: { buffer: this.labelBuffer } },
                 { binding: 1, resource: this.rawIntensityTexture.createView() },
-                { binding: 2, resource: { buffer: this.statsBuffer } }
+                { binding: 2, resource: { buffer: this.statsBuffer } },
+                { binding: 3, resource: { buffer: this.statsParamsBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'stats-accumulate'
         });
         this.device.queue.submit([statsEncoder.finish()]);
 
@@ -406,8 +428,7 @@ export class WebGpuBackend {
 
         const compactCode = COMPACT_STATS_SHADER
             .replace(/{{WIDTH}}/g, this.width)
-            .replace(/{{HEIGHT}}/g, this.height)
-            .replace(/{{MAX_LABELS}}/g, maxExpectedLabels);
+            .replace(/{{HEIGHT}}/g, this.height);
 
         const compactEncoder = this.device.createCommandEncoder();
         this._addComputePass(compactEncoder, {
@@ -416,9 +437,11 @@ export class WebGpuBackend {
             bindings: [
                 { binding: 0, resource: { buffer: this.statsBuffer } },   // The sparse buffer
                 { binding: 1, resource: { buffer: compactStatsBuffer } }, // The dense buffer
-                { binding: 2, resource: { buffer: counterBuffer } }       // The atomic counter
+                { binding: 2, resource: { buffer: counterBuffer } },      // The atomic counter
+                { binding: 3, resource: { buffer: this.statsParamsBuffer } }
             ],
-            dispatchX, dispatchY
+            dispatchX, dispatchY,
+            cacheKey: 'stats-compact'
         });
         this.device.queue.submit([compactEncoder.finish()]);
 
@@ -506,6 +529,10 @@ export class WebGpuBackend {
             this.device.queue.writeBuffer(gpuInput, 0, data);
         }
 
+        // DEFERRED PERF (#3): these scratch buffers (and the per-call stats/counter
+        // buffers in computeStats) are created and destroyed every call. Allocation
+        // is far cheaper than the pipeline compilation now cached above, so a
+        // size-keyed buffer pool is left until profiling points here.
         const gpuHoriz = this.device.createBuffer({ size: this.width * this.height * 4 * 4, usage: GPUBufferUsage.STORAGE });
         const gpuOutput = this.device.createBuffer({ size: outSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
 
@@ -853,6 +880,7 @@ export class WebGpuBackend {
         if (this.labelBuffer)        { this.labelBuffer.destroy();        this.labelBuffer = null; }
         if (this.statsBuffer)        { this.statsBuffer.destroy();        this.statsBuffer = null; }
         if (this.statsCounterBuffer) { this.statsCounterBuffer.destroy(); this.statsCounterBuffer = null; }
+        if (this.statsParamsBuffer)  { this.statsParamsBuffer.destroy();  this.statsParamsBuffer = null; }
         if (this.windowBuffer)       { this.windowBuffer.destroy();       this.windowBuffer = null; }
         // Pipelines have no destroy(); drop references so they can be GC'd.
         this.compositePipeline = null;
@@ -1253,10 +1281,15 @@ struct Metrics {
     min_intensity: atomic<u32>,
     max_intensity: atomic<u32>
 };
+// max_labels is a uniform (not baked into the source) so this shader's text is
+// constant for the image's lifetime and its pipeline can be cached across the
+// many computeStats calls per retrain, even though the label count changes.
+struct Params { max_labels: u32 };
 
 @group(0) @binding(0) var<storage, read> labels: array<u32>;
 @group(0) @binding(1) var raw_intensity: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read_write> stats: array<Metrics>;
+@group(0) @binding(3) var<uniform> params: Params;
 
 fn add64(acc: ptr<storage, U64, read_write>, v: u32) {
     let old = atomicAdd(&(*acc).lo, v);
@@ -1271,7 +1304,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel_idx = id.y * w + id.x;
     let label = labels[pixel_idx];
 
-    if (label == 0u || label >= {{MAX_LABELS}}u) { return; }
+    if (label == 0u || label >= params.max_labels) { return; }
 
     // Read the raw intensity (red channel) and convert to fixed-point integer.
     // SCALE is 1.0 for integer dtypes (exact) — see intensityScale in computeStats.
@@ -1312,9 +1345,13 @@ struct DenseMetrics {
     max_intensity: u32
 };
 
+// max_labels is a uniform (see STATS_ACCUMULATOR_SHADER) so this pipeline caches.
+struct Params { max_labels: u32 };
+
 @group(0) @binding(0) var<storage, read_write> sparse_stats: array<SparseMetrics>;
 @group(0) @binding(1) var<storage, read_write> compact_stats: array<DenseMetrics>;
 @group(0) @binding(2) var<storage, read_write> counter: atomic<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1328,7 +1365,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let label_idx = id.y * w + id.x;
 
     // Check against the maximum expected labels found in Pass 1
-    if (label_idx >= {{MAX_LABELS}}u) { return; }
+    if (label_idx >= params.max_labels) { return; }
     if (label_idx == 0u) { return; }
 
     let area = atomicLoad(&sparse_stats[label_idx].area);
