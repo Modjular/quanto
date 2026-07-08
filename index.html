@@ -4,13 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quanto</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%22100%22>🖐</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%22100%22>🧮</text></svg>">
     <link rel="stylesheet" href="style.css">
 </head>
 <body class="mode-grab">
 
 <div id="top-bar">
-    <h2>Quanto</h2>
+    <h2>🧮 Quanto</h2>
     <div id="status">No images loaded. Drag &amp; drop onto the canvas.</div>
 </div>
 
@@ -162,10 +162,8 @@
         // Setup class selector with stat badges
         document.querySelector('.class-selector').innerHTML = LABEL_COLORS.map((color, index) => `
             <div class="class-item ${index === 0 ? 'active' : ''}" data-class="${index}">
-                <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="color-box" style="background:${color};"></div>
-                    <span contenteditable>Class ${index + 1}</span>
-                </div>
+                <div class="color-box" style="background:${color};"></div>
+                <span contenteditable>Class ${index + 1}</span>
                 <div class="class-stat-badge" id="stat-class-${index}">0</div>
             </div>
         `).join('');

@@ -371,7 +371,7 @@ button:disabled {
 .class-item {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     padding: 8px;
     background: var(--bg-control);
     border-radius: var(--radius-sm);
@@ -389,6 +389,7 @@ button:disabled {
     flex-shrink: 0;
 }
 .class-stat-badge {
+    margin-left: auto;
     font-size: 11px;
     color: #888;
     background: rgba(0,0,0,0.05);
